@@ -12,6 +12,7 @@ mod macos_terminal;
 mod mascot;
 mod mcp;
 mod ngrok;
+mod outline;
 mod process_runner;
 mod server;
 mod startup;

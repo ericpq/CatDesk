@@ -32,6 +32,11 @@ regex = "1"
 globset = "0.4"
 ignore = "0.4"
 similar = "3.1"
+tree-sitter-rust = "0.24.2"
+tree-sitter-python = "0.25.0"
+tree-sitter-go = "0.25.0"
+tree-sitter-javascript = "0.25.0"
+tree-sitter-typescript = "0.23.2"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

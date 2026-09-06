@@ -18,6 +18,7 @@ use crate::command_jobs::{
 };
 use crate::devtools::DevtoolsBridge;
 use crate::mascot;
+use crate::outline;
 use crate::state::{
     AgentsPathMode, Mode, ShowDetailMode, TokenStatsLayout, ToolMode, app_config_path,
     load_app_config, user_home_dir,
@@ -28,6 +29,10 @@ use crate::workspace_tools;
 /// does not borrow `command`'s 120-second ceiling.
 const DEFAULT_CHECK_TIMEOUT_MS: u64 = checks::DEFAULT_TIMEOUT_MS;
 const MAX_CHECK_TIMEOUT_MS: u64 = checks::MAX_TIMEOUT_MS;
+const DEFAULT_MAX_OUTLINE_SYMBOLS: usize = outline::DEFAULT_MAX_SYMBOLS;
+const HARD_MAX_OUTLINE_SYMBOLS: usize = outline::HARD_MAX_SYMBOLS;
+const DEFAULT_MAX_SYMBOL_MATCHES: usize = outline::DEFAULT_MAX_MATCHES;
+const HARD_MAX_SYMBOL_MATCHES: usize = outline::HARD_MAX_MATCHES;
 
 const SERVER_NAME: &str = "catdesk";
 const SERVER_VERSION: &str = "4.0.0";
@@ -771,6 +776,70 @@ fn local_tool_output_schema(name: &str) -> Option<Value> {
                 }),
             );
         }
+        "outline" | "read_symbol" => {
+            for field in ["path", "language"] {
+                properties.insert(field.to_string(), json!({ "type": "string" }));
+            }
+            properties.insert(
+                "symbolCount".to_string(),
+                json!({ "type": "integer", "minimum": 0 }),
+            );
+            properties.insert("truncated".to_string(), json!({ "type": "boolean" }));
+            properties.insert("outlineText".to_string(), json!({ "type": "string" }));
+            properties.insert("name".to_string(), json!({ "type": "string" }));
+            properties.insert("kind".to_string(), json!({ "type": "string" }));
+            properties.insert("text".to_string(), json!({ "type": "string" }));
+            for field in ["line", "endLine"] {
+                properties.insert(
+                    field.to_string(),
+                    json!({ "type": "integer", "minimum": 0 }),
+                );
+            }
+            properties.insert(
+                "symbols".to_string(),
+                json!({
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "kind": { "type": "string" },
+                            "name": { "type": "string" },
+                            "line": { "type": "integer", "minimum": 1 },
+                            "endLine": { "type": "integer", "minimum": 1 },
+                            "depth": { "type": "integer", "minimum": 0 },
+                            "signature": { "type": "string" }
+                        },
+                        "required": ["kind", "name", "line", "endLine", "depth"]
+                    }
+                }),
+            );
+        }
+        "find_symbol" => {
+            properties.insert("query".to_string(), json!({ "type": "string" }));
+            properties.insert(
+                "matchCount".to_string(),
+                json!({ "type": "integer", "minimum": 0 }),
+            );
+            properties.insert("truncated".to_string(), json!({ "type": "boolean" }));
+            properties.insert(
+                "matches".to_string(),
+                json!({
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "path": { "type": "string" },
+                            "kind": { "type": "string" },
+                            "name": { "type": "string" },
+                            "line": { "type": "integer", "minimum": 1 },
+                            "endLine": { "type": "integer", "minimum": 1 },
+                            "signature": { "type": "string" }
+                        },
+                        "required": ["path", "kind", "name", "line"]
+                    }
+                }),
+            );
+        }
         "checkpoint_list" => {
             properties.insert(
                 "count".to_string(),
@@ -1019,6 +1088,52 @@ async fn handle_tools_list_with_show_detail_mode(
                     "no_ignore": { "type": "boolean", "description": "Do not respect ignore files" }
                 },
                 "required": ["pattern"]
+            },
+            "annotations": { "readOnlyHint": true, "openWorldHint": false, "destructiveHint": false }
+        }));
+        tools.push(json!({
+            "name": "outline",
+            "title": "Outline file",
+            "description": "List the definitions in a source file with their line numbers and nesting: functions, types, classes, methods, traits, interfaces. Use this instead of read on a file too large to read whole, then read_symbol for the part you need. Supports Rust, Python, JavaScript, TypeScript and Go.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "Source file relative to workspace root" },
+                    "max_symbols": { "type": "integer", "minimum": 1, "maximum": HARD_MAX_OUTLINE_SYMBOLS, "description": format!("Maximum symbols to return (default {DEFAULT_MAX_OUTLINE_SYMBOLS})") },
+                    "include_symbols": { "type": "boolean", "description": "Also return one object per symbol with its byte and line range. Off by default: the rendered outline in outlineText carries the same names and line numbers in a third of the space." }
+                },
+                "required": ["path"]
+            },
+            "annotations": { "readOnlyHint": true, "openWorldHint": false, "destructiveHint": false }
+        }));
+        tools.push(json!({
+            "name": "find_symbol",
+            "title": "Find symbol",
+            "description": "Find where a function, type, class or method is defined, anywhere under a workspace directory. Returns the file, line and signature of each definition. Prefer this over search when looking for a definition rather than every mention of a name.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string", "minLength": 1, "description": "Symbol name to look for" },
+                    "path": { "type": "string", "description": "Directory to search relative to workspace root (default: workspace root)" },
+                    "exact": { "type": "boolean", "description": "Match the whole name instead of a case-insensitive substring (default false)" },
+                    "max_results": { "type": "integer", "minimum": 1, "maximum": HARD_MAX_SYMBOL_MATCHES, "description": format!("Maximum matches to return (default {DEFAULT_MAX_SYMBOL_MATCHES})") }
+                },
+                "required": ["name"]
+            },
+            "annotations": { "readOnlyHint": true, "openWorldHint": false, "destructiveHint": false }
+        }));
+        tools.push(json!({
+            "name": "read_symbol",
+            "title": "Read symbol",
+            "description": "Read the source of one definition by name, instead of the whole file it lives in.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "Source file relative to workspace root" },
+                    "name": { "type": "string", "minLength": 1, "description": "Exact symbol name, as reported by outline or find_symbol" },
+                    "kind": { "type": "string", "description": "Optional node kind to disambiguate, as reported by outline" }
+                },
+                "required": ["path", "name"]
             },
             "annotations": { "readOnlyHint": true, "openWorldHint": false, "destructiveHint": false }
         }));
@@ -1333,6 +1448,9 @@ async fn handle_tools_call_with_show_detail_mode(
                 match tool_name.as_str() {
                     "read" => handle_read_files(req, workspace_root),
                     "search" => handle_search_text(req, workspace_root),
+                    "outline" => handle_outline(req, workspace_root),
+                    "find_symbol" => handle_find_symbol(req, workspace_root),
+                    "read_symbol" => handle_read_symbol(req, workspace_root),
                     "git_status" => handle_git_status(req, workspace_root).await,
                     "git_diff" => handle_git_diff(req, workspace_root).await,
                     "git_log" => handle_git_log(req, workspace_root).await,
@@ -2095,6 +2213,235 @@ fn capture_checkpoint_for_request(req: &JsonRpcRequest, tool_name: &str, workspa
     checkpoints::capture(Path::new(workspace_root), tool_name, &paths);
 }
 
+fn symbol_json(symbol: &outline::Symbol) -> Value {
+    json!({
+        "kind": symbol.kind,
+        "name": symbol.name,
+        "line": symbol.line,
+        "endLine": symbol.end_line,
+        "depth": symbol.depth,
+        "signature": symbol.signature,
+    })
+}
+
+/// Resolve a workspace path and identify the language, or explain which of the
+/// two failed. "unsupported file type" and "file is missing" need different
+/// answers from the caller.
+fn resolve_source_file(
+    workspace_root: &str,
+    input: &str,
+) -> Result<(PathBuf, outline::Language, String), String> {
+    let path = command::resolve_workspace_path(workspace_root, Some(input))
+        .map_err(|error| format!("code: PATH_OUTSIDE_WORKSPACE\nmessage: {error}"))?;
+    let Some(language) = outline::Language::from_path(&path) else {
+        return Err(format!(
+            "No outline support for {input}: expected a Rust, Python, JavaScript, TypeScript or Go source file"
+        ));
+    };
+    let Some(source) = outline::read_source(&path) else {
+        return Err(format!(
+            "Could not read {input} as text, or it is past the parse size limit"
+        ));
+    };
+    Ok((path, language, source))
+}
+
+fn handle_outline(req: &JsonRpcRequest, workspace_root: &str) -> JsonRpcResponse {
+    let arguments = tool_arguments(req);
+    let path_input = match required_string_argument(&arguments, "path") {
+        Ok(value) => value,
+        Err(error) => return tool_error_response(req, error),
+    };
+    let max_symbols = match optional_usize_argument(&arguments, "max_symbols") {
+        Ok(Some(value)) => value.clamp(1, HARD_MAX_OUTLINE_SYMBOLS),
+        Ok(None) => DEFAULT_MAX_OUTLINE_SYMBOLS,
+        Err(error) => return tool_error_response(req, error),
+    };
+    let (_, language, source) = match resolve_source_file(workspace_root, path_input) {
+        Ok(resolved) => resolved,
+        Err(error) => return tool_error_response(req, error),
+    };
+
+    let include_symbols = match optional_bool_argument(&arguments, "include_symbols", false) {
+        Ok(value) => value,
+        Err(error) => return tool_error_response(req, error),
+    };
+
+    let symbols = outline::outline(&source, language, max_symbols);
+    let truncated = symbols.len() >= max_symbols;
+    let mut structured = json!({
+        "toolName": "outline",
+        "path": path_input,
+        "language": language.as_str(),
+        "symbolCount": symbols.len(),
+        "truncated": truncated,
+        "outlineText": outline::render(&symbols),
+    });
+    if include_symbols
+        && let Some(object) = structured.as_object_mut()
+    {
+        object.insert(
+            "symbols".to_string(),
+            json!(symbols.iter().map(symbol_json).collect::<Vec<_>>()),
+        );
+    }
+    let summary = format!(
+        "{path_input} ({}, {} symbols{})",
+        language.as_str(),
+        symbols.len(),
+        if truncated { ", truncated" } else { "" }
+    );
+    tool_success_response_with_structured(req, summary, structured)
+}
+
+fn handle_find_symbol(req: &JsonRpcRequest, workspace_root: &str) -> JsonRpcResponse {
+    let arguments = tool_arguments(req);
+    let needle = match required_string_argument(&arguments, "name") {
+        Ok(value) if !value.trim().is_empty() => value,
+        Ok(_) => return tool_error_response(req, "Symbol name must not be empty".into()),
+        Err(error) => return tool_error_response(req, error),
+    };
+    let root = match optional_string_argument(&arguments, "path") {
+        Ok(value) => match command::resolve_workspace_path(workspace_root, value) {
+            Ok(root) => root,
+            Err(error) => {
+                return tool_error_response(
+                    req,
+                    format!("code: PATH_OUTSIDE_WORKSPACE\nmessage: {error}"),
+                );
+            }
+        },
+        Err(error) => return tool_error_response(req, error),
+    };
+    let exact = match optional_bool_argument(&arguments, "exact", false) {
+        Ok(value) => value,
+        Err(error) => return tool_error_response(req, error),
+    };
+    let max_results = match optional_usize_argument(&arguments, "max_results") {
+        Ok(Some(value)) => value.clamp(1, HARD_MAX_SYMBOL_MATCHES),
+        Ok(None) => DEFAULT_MAX_SYMBOL_MATCHES,
+        Err(error) => return tool_error_response(req, error),
+    };
+
+    // Reported paths are relative to the workspace, and the walked paths come
+    // from a canonical root, so the prefix has to be canonical too.
+    let workspace_path = Path::new(workspace_root)
+        .canonicalize()
+        .unwrap_or_else(|_| PathBuf::from(workspace_root));
+    let (matches, truncated) =
+        outline::find_symbol(&root, &workspace_path, needle, exact, max_results);
+    let text = if matches.is_empty() {
+        format!("No definition of {needle} was found")
+    } else {
+        matches
+            .iter()
+            .map(|hit| {
+                format!(
+                    "{}:{}  {} {}\n  {}",
+                    hit.path, hit.symbol.line, hit.symbol.kind, hit.symbol.name, hit.symbol.signature
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    tool_success_response_with_structured(
+        req,
+        text,
+        json!({
+            "toolName": "find_symbol",
+            "query": needle,
+            "matchCount": matches.len(),
+            "truncated": truncated,
+            "matches": matches
+                .iter()
+                .map(|hit| {
+                    json!({
+                        "path": hit.path,
+                        "kind": hit.symbol.kind,
+                        "name": hit.symbol.name,
+                        "line": hit.symbol.line,
+                        "endLine": hit.symbol.end_line,
+                        "signature": hit.symbol.signature,
+                    })
+                })
+                .collect::<Vec<_>>(),
+        }),
+    )
+}
+
+fn handle_read_symbol(req: &JsonRpcRequest, workspace_root: &str) -> JsonRpcResponse {
+    let arguments = tool_arguments(req);
+    let path_input = match required_string_argument(&arguments, "path") {
+        Ok(value) => value,
+        Err(error) => return tool_error_response(req, error),
+    };
+    let name = match required_string_argument(&arguments, "name") {
+        Ok(value) => value,
+        Err(error) => return tool_error_response(req, error),
+    };
+    let kind = match optional_string_argument(&arguments, "kind") {
+        Ok(value) => value,
+        Err(error) => return tool_error_response(req, error),
+    };
+    let (_, language, source) = match resolve_source_file(workspace_root, path_input) {
+        Ok(resolved) => resolved,
+        Err(error) => return tool_error_response(req, error),
+    };
+
+    let symbols = outline::outline(&source, language, outline::HARD_MAX_SYMBOLS);
+    let selected: Vec<&outline::Symbol> = symbols
+        .iter()
+        .filter(|symbol| symbol.name == name)
+        .filter(|symbol| kind.is_none_or(|kind| symbol.kind == kind))
+        .collect();
+    let Some(symbol) = selected.first().copied() else {
+        // Naming the near misses saves a round trip through outline.
+        let nearby: Vec<&str> = symbols
+            .iter()
+            .filter(|symbol| symbol.name.contains(name))
+            .map(|symbol| symbol.name.as_str())
+            .take(10)
+            .collect();
+        let hint = if nearby.is_empty() {
+            String::new()
+        } else {
+            format!(" Similar names in this file: {}.", nearby.join(", "))
+        };
+        return tool_error_response(
+            req,
+            format!("No definition named {name} in {path_input}.{hint}"),
+        );
+    };
+
+    let body = source.get(symbol.start_byte..symbol.end_byte).unwrap_or("");
+    let mut text = body.to_string();
+    let truncated = text.len() > workspace_tools::MAX_READ_BYTES;
+    if truncated {
+        let mut end = workspace_tools::MAX_READ_BYTES;
+        while end > 0 && !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        text.truncate(end);
+    }
+
+    tool_success_response_with_structured(
+        req,
+        text.clone(),
+        json!({
+            "toolName": "read_symbol",
+            "path": path_input,
+            "language": language.as_str(),
+            "name": symbol.name,
+            "kind": symbol.kind,
+            "line": symbol.line,
+            "endLine": symbol.end_line,
+            "symbolCount": selected.len(),
+            "truncated": truncated,
+            "text": text,
+        }),
+    )
+}
+
 fn handle_checkpoint_list(req: &JsonRpcRequest, workspace_root: &str) -> JsonRpcResponse {
     let recorded = checkpoints::list(Path::new(workspace_root));
     let items: Vec<Value> = recorded
@@ -2272,8 +2619,8 @@ async fn handle_run_checks(req: &JsonRpcRequest, workspace_root: &str) -> JsonRp
     // A runner can exit non-zero for reasons the parser did not see, and in
     // principle exit zero with failures in its output. Treat both as failing.
     let verdict = result.success && outcome.failed.unwrap_or(0) == 0;
-    let mut text = format!(
-        "{} ({}) {} - exited {} in {} ms",
+    let text = format!(
+        "{} ({}) {} - exited {} in {} ms{}",
         command_text,
         kind.as_str(),
         if verdict { "PASSED" } else { "FAILED" },
@@ -2281,42 +2628,13 @@ async fn handle_run_checks(req: &JsonRpcRequest, workspace_root: &str) -> JsonRp
             .exit_code
             .map(|code| code.to_string())
             .unwrap_or_else(|| "?".to_string()),
-        result.elapsed_ms
+        result.elapsed_ms,
+        if result.timed_out {
+            format!(" (timed out after {timeout_ms} ms)")
+        } else {
+            String::new()
+        }
     );
-    if result.timed_out {
-        text.push_str(&format!(" (timed out after {timeout_ms} ms)"));
-    }
-    if let Some(summary) = outcome.summary.as_deref() {
-        text.push('\n');
-        text.push_str(summary);
-    }
-    for failure in outcome.failures.iter().take(20) {
-        text.push_str(&format!("\nFAIL {}", failure.name));
-        if let Some(file) = failure.file.as_deref() {
-            text.push_str(&format!(
-                "\n  {}:{}",
-                file,
-                failure
-                    .line
-                    .map(|line| line.to_string())
-                    .unwrap_or_else(|| "?".to_string())
-            ));
-        }
-        if let Some(message) = failure.message.as_deref() {
-            text.push_str(&format!("\n  {message}"));
-        }
-    }
-    for diagnostic in outcome.diagnostics.iter().take(20) {
-        text.push_str(&format!(
-            "\n{} {}:{} {}",
-            diagnostic.severity, diagnostic.file, diagnostic.line, diagnostic.message
-        ));
-    }
-    // Nothing could be parsed, so the raw tail is the only signal there is.
-    if outcome.failures.is_empty() && outcome.diagnostics.is_empty() && outcome.summary.is_none() {
-        text.push_str("\n--- output tail ---\n");
-        text.push_str(&tail);
-    }
 
     let structured = json!({
         "toolName": "run_checks",
@@ -3036,6 +3354,10 @@ Always specify the branch explicitly when using `git push`."#
                     .to_string(),
             );
             lines.push(
+                "Reading a file is capped at 32 KiB, which is smaller than many real source files. Use outline to see a file's definitions with their line numbers, find_symbol to locate a definition across the workspace, and read_symbol to read one definition, before falling back to reading a whole file."
+                    .to_string(),
+            );
+            lines.push(
                 "Use run_checks to run tests, builds and type checks. It returns pass/fail counts, the failing test names and file/line diagnostics, so a failure can be acted on directly instead of read out of a transcript."
                     .to_string(),
             );
@@ -3329,7 +3651,10 @@ fn attach_tool_call_count(result: &mut Value, tool_call_count: u64) {
 fn tool_descriptor_should_attach_widget(name: &str) -> bool {
     matches!(
         name,
-        "run_checks"
+        "outline"
+            | "find_symbol"
+            | "read_symbol"
+            | "run_checks"
             | "checkpoint_list"
             | "checkpoint_restore"
             | "run_command"
@@ -5199,6 +5524,9 @@ mod tests {
                 "catdesk_instruction",
                 "read",
                 "search",
+                "outline",
+                "find_symbol",
+                "read_symbol",
                 "git_status",
                 "git_diff",
                 "git_log",
@@ -5565,6 +5893,9 @@ mod tests {
                 "catdesk_instruction",
                 "read",
                 "search",
+                "outline",
+                "find_symbol",
+                "read_symbol",
                 "git_status",
                 "git_diff",
                 "git_log",

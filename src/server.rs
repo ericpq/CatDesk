@@ -1692,7 +1692,7 @@ mod tests {
         }
         let (success, widgets) = tracked.expect("missing bootstrap tools/list event");
         assert!(success);
-        assert_eq!(widgets.len(), 19);
+        assert_eq!(widgets.len(), 22);
         assert_eq!(
             widgets
                 .iter()
@@ -1707,6 +1707,9 @@ mod tests {
                 "catdesk_instruction",
                 "read",
                 "search",
+                "outline",
+                "find_symbol",
+                "read_symbol",
                 "git_status",
                 "git_diff",
                 "git_log",
