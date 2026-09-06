@@ -564,6 +564,15 @@ fn local_tool_output_schema(name: &str) -> Option<Value> {
                 }),
             );
         }
+        "git_status" | "git_diff" | "git_log" | "git_add" | "git_commit" => {
+            properties.insert("cwd".to_string(), json!({ "type": "string" }));
+            properties.insert("stdout".to_string(), json!({ "type": "string" }));
+            properties.insert("stderr".to_string(), json!({ "type": "string" }));
+            properties.insert(
+                "exitCode".to_string(),
+                json!({ "type": ["integer", "null"] }),
+            );
+        }
         "write" => {
             properties.insert("path".to_string(), json!({ "type": "string" }));
             properties.insert(
@@ -585,6 +594,11 @@ fn local_tool_output_schema(name: &str) -> Option<Value> {
                     json!({ "type": "integer", "minimum": 0 }),
                 );
             }
+        }
+        "apply_patch" => {
+            properties.insert("cwd".to_string(), json!({ "type": "string" }));
+            properties.insert("stdout".to_string(), json!({ "type": "string" }));
+            properties.insert("stderr".to_string(), json!({ "type": "string" }));
         }
         "delete" => {
             properties.insert("path".to_string(), json!({ "type": "string" }));
@@ -849,7 +863,7 @@ async fn handle_tools_list_with_show_detail_mode(
         tools.push(json!({
             "name": "read",
             "title": "Read files",
-            "description": "Read text files from the workspace. Name every file you need in one call.",
+            "description": "Read text files from the workspace. Name every file you need in one call; each file is capped at 32 KiB and the combined response at 64 KiB.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -892,8 +906,82 @@ async fn handle_tools_list_with_show_detail_mode(
             },
             "annotations": { "readOnlyHint": true, "openWorldHint": false, "destructiveHint": false }
         }));
+        tools.push(json!({
+            "name": "git_status",
+            "title": "Git status",
+            "description": "Show concise Git working-tree and branch status for a repository inside the workspace.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "cwd": { "type": "string", "description": "Repository directory relative to workspace root (default: workspace root)" }
+                }
+            },
+            "annotations": { "readOnlyHint": true, "openWorldHint": false, "destructiveHint": false }
+        }));
+        tools.push(json!({
+            "name": "git_diff",
+            "title": "Git diff",
+            "description": "Show Git diff for unstaged or staged changes in a repository inside the workspace.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "cwd": { "type": "string", "description": "Repository directory relative to workspace root (default: workspace root)" },
+                    "staged": { "type": "boolean", "description": "Show staged/index diff instead of unstaged diff (default false)" },
+                    "path": { "type": "string", "description": "Optional path filter inside the repository" }
+                }
+            },
+            "annotations": { "readOnlyHint": true, "openWorldHint": false, "destructiveHint": false }
+        }));
+        tools.push(json!({
+            "name": "git_log",
+            "title": "Git log",
+            "description": "Show recent Git commits in concise one-line form for a repository inside the workspace.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "cwd": { "type": "string", "description": "Repository directory relative to workspace root (default: workspace root)" },
+                    "max_count": { "type": "integer", "minimum": 1, "maximum": 100, "description": "Maximum commits to return (default 10)" },
+                    "path": { "type": "string", "description": "Optional path filter inside the repository" }
+                }
+            },
+            "annotations": { "readOnlyHint": true, "openWorldHint": false, "destructiveHint": false }
+        }));
 
         if tool_mode.write_tools_enabled() {
+            tools.push(json!({
+                "name": "git_add",
+                "title": "Git add",
+                "description": "Stage one or more workspace paths in a Git repository.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "cwd": { "type": "string", "description": "Repository directory relative to workspace root (default: workspace root)" },
+                        "paths": {
+                            "type": "array",
+                            "items": { "type": "string", "minLength": 1 },
+                            "minItems": 1,
+                            "maxItems": 64,
+                            "description": "Repository-relative paths to stage"
+                        }
+                    },
+                    "required": ["paths"]
+                },
+                "annotations": { "readOnlyHint": false, "openWorldHint": true, "destructiveHint": true }
+            }));
+            tools.push(json!({
+                "name": "git_commit",
+                "title": "Git commit",
+                "description": "Create a Git commit from the currently staged changes. CatDesk co-author settings are respected.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "cwd": { "type": "string", "description": "Repository directory relative to workspace root (default: workspace root)" },
+                        "message": { "type": "string", "minLength": 1, "description": "Commit message" }
+                    },
+                    "required": ["message"]
+                },
+                "annotations": { "readOnlyHint": false, "openWorldHint": true, "destructiveHint": true }
+            }));
             tools.push(json!({
                 "name": "write",
                 "title": "Write file",
@@ -949,6 +1037,20 @@ async fn handle_tools_list_with_show_detail_mode(
                         }
                     },
                     "required": ["path", "edits"]
+                },
+                "annotations": { "readOnlyHint": false, "openWorldHint": false, "destructiveHint": true }
+            }));
+            tools.push(json!({
+                "name": "apply_patch",
+                "title": "Apply patch",
+                "description": "Apply a unified diff patch relative to cwd inside the workspace. Patch headers, rename/copy metadata, and Git's own unsafe-path checks must all stay within the workspace. The patch is dry-run checked before it is applied.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "patch": { "type": "string", "minLength": 1, "description": "Unified diff text, typically with a/ and b/ paths" },
+                        "cwd": { "type": "string", "description": "Directory inside the workspace that patch paths are relative to; defaults to the workspace root" }
+                    },
+                    "required": ["patch"]
                 },
                 "annotations": { "readOnlyHint": false, "openWorldHint": false, "destructiveHint": true }
             }));
@@ -1090,11 +1192,20 @@ async fn handle_tools_call_with_show_detail_mode(
                 match tool_name.as_str() {
                     "read" => handle_read_files(req, workspace_root),
                     "search" => handle_search_text(req, workspace_root),
+                    "git_status" => handle_git_status(req, workspace_root).await,
+                    "git_diff" => handle_git_diff(req, workspace_root).await,
+                    "git_log" => handle_git_log(req, workspace_root).await,
                     _ => {
                         if tool_mode.write_tools_enabled() {
                             match tool_name.as_str() {
+                                "git_add" => handle_git_add(req, workspace_root).await,
+                                "git_commit" => {
+                                    handle_git_commit(req, workspace_root, set_catdesk_as_co_author)
+                                        .await
+                                }
                                 "write" => handle_write_file(req, workspace_root),
                                 "edit" => handle_edit_file(req, workspace_root),
+                                "apply_patch" => handle_apply_patch(req, workspace_root).await,
                                 "delete" => handle_delete_path(req, workspace_root),
                                 _ => {
                                     if mode.browser_enabled() {
@@ -1322,6 +1433,9 @@ async fn handle_start_command(
         Ok(value) => value,
         Err(error) => return tool_error_response(req, error),
     };
+    if let Some(reason) = command::blocked_destructive_command(command_text) {
+        return tool_error_response(req, reason.into());
+    }
     if command::contains_catdesk_co_author_marker(command_text) {
         let message = if set_catdesk_as_co_author {
             "Rewrite the commit message normally and remove \"Co-Authored-By: CatDesk\". CatDesk will add that trailer automatically."
@@ -1477,6 +1591,354 @@ async fn handle_cancel_command(
     }
 }
 
+fn resolve_git_cwd(arguments: &Value, workspace_root: &str) -> Result<PathBuf, String> {
+    let cwd_input = optional_string_argument(arguments, "cwd")?;
+    let cwd = command::resolve_workspace_path(workspace_root, cwd_input)
+        .map_err(|error| format!("code: PATH_OUTSIDE_WORKSPACE\nmessage: {error}"))?;
+    if !cwd.is_dir() {
+        return Err(format!("Git cwd is not a directory: {}", cwd.display()));
+    }
+    Ok(cwd)
+}
+
+fn validate_git_path(path: &str) -> Result<(), String> {
+    if path.trim().is_empty() {
+        return Err("Git path must not be empty".into());
+    }
+    let parsed = Path::new(path);
+    if parsed.is_absolute()
+        || parsed
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        return Err(format!("Git path must stay inside the repository: {path}"));
+    }
+    Ok(())
+}
+
+async fn run_git_command(
+    req: &JsonRpcRequest,
+    workspace_root: &str,
+    cwd: &Path,
+    tool_name: &str,
+    args: &[String],
+) -> JsonRpcResponse {
+    let mut command_text = String::from("git");
+    for arg in args {
+        command_text.push(' ');
+        command_text.push_str(&shell_quote(arg));
+    }
+    let result = command::run_command(
+        &command_text,
+        Path::new(workspace_root),
+        cwd,
+        command::MAX_TIMEOUT_MS,
+    )
+    .await;
+    let text = command::format_result(&result);
+    let structured = json!({
+        "toolName": tool_name,
+        "cwd": cwd.to_string_lossy().to_string(),
+        "stdout": result.stdout,
+        "stderr": result.stderr,
+        "exitCode": result.exit_code,
+        "success": result.success,
+    });
+    if result.success {
+        tool_success_response_with_structured(req, text, structured)
+    } else {
+        tool_error_response_with_structured(req, text, structured)
+    }
+}
+
+async fn handle_git_status(req: &JsonRpcRequest, workspace_root: &str) -> JsonRpcResponse {
+    let arguments = tool_arguments(req);
+    let cwd = match resolve_git_cwd(&arguments, workspace_root) {
+        Ok(cwd) => cwd,
+        Err(error) => return tool_error_response(req, error),
+    };
+    run_git_command(
+        req,
+        workspace_root,
+        &cwd,
+        "git_status",
+        &["status".into(), "--short".into(), "--branch".into()],
+    )
+    .await
+}
+
+async fn handle_git_diff(req: &JsonRpcRequest, workspace_root: &str) -> JsonRpcResponse {
+    let arguments = tool_arguments(req);
+    let cwd = match resolve_git_cwd(&arguments, workspace_root) {
+        Ok(cwd) => cwd,
+        Err(error) => return tool_error_response(req, error),
+    };
+    let staged = match optional_bool_argument(&arguments, "staged", false) {
+        Ok(value) => value,
+        Err(error) => return tool_error_response(req, error),
+    };
+    let path = match optional_string_argument(&arguments, "path") {
+        Ok(value) => value,
+        Err(error) => return tool_error_response(req, error),
+    };
+    if let Some(path) = path
+        && let Err(error) = validate_git_path(path)
+    {
+        return tool_error_response(req, error);
+    }
+    let mut args = vec![
+        "diff".into(),
+        "--no-ext-diff".into(),
+        "--no-textconv".into(),
+    ];
+    if staged {
+        args.push("--cached".into());
+    }
+    if let Some(path) = path {
+        args.push("--".into());
+        args.push(path.into());
+    }
+    run_git_command(req, workspace_root, &cwd, "git_diff", &args).await
+}
+
+async fn handle_git_log(req: &JsonRpcRequest, workspace_root: &str) -> JsonRpcResponse {
+    let arguments = tool_arguments(req);
+    let cwd = match resolve_git_cwd(&arguments, workspace_root) {
+        Ok(cwd) => cwd,
+        Err(error) => return tool_error_response(req, error),
+    };
+    let max_count = match optional_usize_argument(&arguments, "max_count") {
+        Ok(Some(value)) if (1..=100).contains(&value) => value,
+        Ok(Some(_)) => {
+            return tool_error_response(req, "max_count must be between 1 and 100".into());
+        }
+        Ok(None) => 10,
+        Err(error) => return tool_error_response(req, error),
+    };
+    let path = match optional_string_argument(&arguments, "path") {
+        Ok(value) => value,
+        Err(error) => return tool_error_response(req, error),
+    };
+    if let Some(path) = path
+        && let Err(error) = validate_git_path(path)
+    {
+        return tool_error_response(req, error);
+    }
+    let mut args = vec![
+        "log".into(),
+        "--oneline".into(),
+        "--decorate".into(),
+        "-n".into(),
+        max_count.to_string(),
+    ];
+    if let Some(path) = path {
+        args.push("--".into());
+        args.push(path.into());
+    }
+    run_git_command(req, workspace_root, &cwd, "git_log", &args).await
+}
+
+async fn handle_git_add(req: &JsonRpcRequest, workspace_root: &str) -> JsonRpcResponse {
+    let arguments = tool_arguments(req);
+    let cwd = match resolve_git_cwd(&arguments, workspace_root) {
+        Ok(cwd) => cwd,
+        Err(error) => return tool_error_response(req, error),
+    };
+    let paths = match arguments.get("paths").and_then(Value::as_array) {
+        Some(paths) if !paths.is_empty() && paths.len() <= 64 => paths,
+        Some(_) => {
+            return tool_error_response(req, "paths must contain between 1 and 64 entries".into());
+        }
+        None => return tool_error_response(req, "Missing required parameter: paths".into()),
+    };
+    let mut args = vec!["add".into(), "--".into()];
+    for value in paths {
+        let Some(path) = value.as_str() else {
+            return tool_error_response(req, "Every paths entry must be a string".into());
+        };
+        if let Err(error) = validate_git_path(path) {
+            return tool_error_response(req, error);
+        }
+        args.push(path.into());
+    }
+    run_git_command(req, workspace_root, &cwd, "git_add", &args).await
+}
+
+async fn handle_git_commit(
+    req: &JsonRpcRequest,
+    workspace_root: &str,
+    set_catdesk_as_co_author: bool,
+) -> JsonRpcResponse {
+    let arguments = tool_arguments(req);
+    let cwd = match resolve_git_cwd(&arguments, workspace_root) {
+        Ok(cwd) => cwd,
+        Err(error) => return tool_error_response(req, error),
+    };
+    let message = match required_string_argument(&arguments, "message") {
+        Ok(message) if !message.trim().is_empty() => message,
+        Ok(_) => return tool_error_response(req, "Commit message must not be empty".into()),
+        Err(error) => return tool_error_response(req, error),
+    };
+    if command::contains_catdesk_co_author_marker(message) {
+        let error = if set_catdesk_as_co_author {
+            "Remove the CatDesk co-author trailer from the message; CatDesk will add it automatically."
+        } else {
+            "Do not include a CatDesk co-author trailer; the user disabled that attribution."
+        };
+        return tool_error_response(req, error.into());
+    }
+    let identity_missing = git_config_missing(workspace_root, &cwd, "user.name").await
+        || git_config_missing(workspace_root, &cwd, "user.email").await;
+    let mut args = Vec::new();
+    if identity_missing {
+        args.extend([
+            "-c".into(),
+            "user.name=CatDesk".into(),
+            "-c".into(),
+            "user.email=catdesk@localhost".into(),
+        ]);
+    }
+    args.push("commit".into());
+    if set_catdesk_as_co_author {
+        args.push("--trailer".into());
+        args.push(command::CATDESK_CO_AUTHOR_TRAILER.into());
+    }
+    args.push("-m".into());
+    args.push(message.into());
+    run_git_command(req, workspace_root, &cwd, "git_commit", &args).await
+}
+
+async fn git_config_missing(workspace_root: &str, cwd: &Path, key: &str) -> bool {
+    let result = command::run_command(
+        &format!("git config --get {}", shell_quote(key)),
+        Path::new(workspace_root),
+        cwd,
+        command::MAX_TIMEOUT_MS,
+    )
+    .await;
+    !result.success || result.stdout.trim().is_empty()
+}
+
+async fn handle_apply_patch(req: &JsonRpcRequest, workspace_root: &str) -> JsonRpcResponse {
+    let arguments = tool_arguments(req);
+    let patch = match required_string_argument(&arguments, "patch") {
+        Ok(value) => value,
+        Err(error) => return tool_error_response(req, error),
+    };
+    if patch.trim().is_empty() {
+        return tool_error_response(req, "Patch must not be empty".into());
+    }
+    let cwd = match resolve_git_cwd(&arguments, workspace_root) {
+        Ok(cwd) => cwd,
+        Err(error) => return tool_error_response(req, error),
+    };
+    for raw in patch_paths(patch) {
+        if raw == "/dev/null" {
+            continue;
+        }
+        let path = raw
+            .strip_prefix("a/")
+            .or_else(|| raw.strip_prefix("b/"))
+            .unwrap_or(raw);
+        if Path::new(path).is_absolute()
+            || Path::new(path)
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            return tool_error_response(req, format!("Patch path escapes cwd: {raw}"));
+        }
+    }
+
+    let patch_dir = Path::new(workspace_root).join(".catdesk");
+    if let Err(error) = std::fs::create_dir_all(&patch_dir) {
+        return tool_error_response(
+            req,
+            format!("Failed to create patch scratch directory: {error}"),
+        );
+    }
+    let patch_path = patch_dir.join(format!("apply-{}.patch", uuid::Uuid::new_v4()));
+    if let Err(error) = std::fs::write(&patch_path, patch) {
+        return tool_error_response(req, format!("Failed to write patch scratch file: {error}"));
+    }
+    let patch_file = patch_path.to_string_lossy().to_string();
+    let check_cmd = format!(
+        "git apply --check --whitespace=nowarn -- {}",
+        shell_quote(&patch_file)
+    );
+    let check = command::run_command(
+        &check_cmd,
+        Path::new(workspace_root),
+        &cwd,
+        command::MAX_TIMEOUT_MS,
+    )
+    .await;
+    if !check.success {
+        let _ = std::fs::remove_file(&patch_path);
+        return tool_error_response_with_structured(
+            req,
+            command::format_result(&check),
+            json!({
+                "toolName": "apply_patch", "cwd": cwd.to_string_lossy(), "stdout": check.stdout, "stderr": check.stderr, "success": false
+            }),
+        );
+    }
+    let apply_cmd = format!(
+        "git apply --whitespace=nowarn -- {}",
+        shell_quote(&patch_file)
+    );
+    let result = command::run_command(
+        &apply_cmd,
+        Path::new(workspace_root),
+        &cwd,
+        command::MAX_TIMEOUT_MS,
+    )
+    .await;
+    let _ = std::fs::remove_file(&patch_path);
+    let text = if result.success {
+        "Patch applied successfully".to_string()
+    } else {
+        command::format_result(&result)
+    };
+    let structured = json!({
+        "toolName": "apply_patch", "cwd": cwd.to_string_lossy(), "stdout": result.stdout, "stderr": result.stderr, "success": result.success
+    });
+    if result.success {
+        tool_success_response_with_structured(req, text, structured)
+    } else {
+        tool_error_response_with_structured(req, text, structured)
+    }
+}
+
+fn patch_paths(patch: &str) -> Vec<&str> {
+    let mut paths = Vec::new();
+    for line in patch.lines() {
+        if let Some(rest) = line.strip_prefix("diff --git ") {
+            paths.extend(rest.split_whitespace().take(2));
+            continue;
+        }
+        for prefix in [
+            "--- ",
+            "+++ ",
+            "rename from ",
+            "rename to ",
+            "copy from ",
+            "copy to ",
+        ] {
+            if let Some(rest) = line.strip_prefix(prefix) {
+                if let Some(path) = rest.split_whitespace().next() {
+                    paths.push(path.trim_matches('"'));
+                }
+                break;
+            }
+        }
+    }
+    paths
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
 async fn handle_run_command(
     req: &JsonRpcRequest,
     workspace_root: &str,
@@ -1490,6 +1952,9 @@ async fn handle_run_command(
             return tool_error_response(req, "Missing required parameter: command".into());
         }
     };
+    if let Some(reason) = command::blocked_destructive_command(cmd) {
+        return tool_error_response(req, reason.into());
+    }
 
     let cwd_input = arguments.get("cwd").and_then(|v| v.as_str());
     let timeout_ms = arguments.get("timeout").and_then(|v| v.as_u64());
@@ -2086,7 +2551,7 @@ Prefer dedicated MCP tools whenever a dedicated tool can complete the task.
 You may encounter connector tool paths that include a link segment, for example "/some_connector_name/link_69c7196cc06c8191b774a1102e140d77/search".
 Always ignore the link_ segment and call the original tool name instead, for example "/some_connector_name/search". This improves tool-calling stability.
 Even if api_tool returns a link_ version of a tool path, never call the link_ path directly.
-If a tool call fails with a message like "This tool call was blocked by OpenAI's safety checks...", simply call the same tool again with the same parameters.
+Retry an identical tool call at most once, and only for an evidently transient transport or connector error. If the same failure repeats, inspect the state, change strategy, or report the blocker; never loop identical calls.
 If the custom connector disconnects, returns an empty list or `Resource not found:`, always call api_tool.list_resources to refresh.
 Keep file and directory operations inside the workspace root unless a tool explicitly says otherwise.
 You already have the built-in sandbox container environment. However, CatDesk offers another environment called Workspace. When a user asks you to do anything, use Workspace first, since the user expects you to control their computer rather than your sandbox container.
@@ -2095,6 +2560,23 @@ Always specify the branch explicitly when using `git push`."#
         .lines()
         .map(str::to_string)
         .collect();
+
+    lines.push(
+        "Agent loop: inspect the current state, make a short plan, perform the next safe action, verify its result, and continue until the requested outcome is complete or a concrete blocker requires the user. Do not stop after merely proposing steps when the tools can safely carry them out."
+            .to_string(),
+    );
+    lines.push(
+        "Verification contract: never claim success from generated code or a process start alone. Run proportionate tests and check the final observable state. For service changes, require sustained health plus an end-to-end functional probe, and retain a tested rollback path."
+            .to_string(),
+    );
+    lines.push(
+        "Workspace safety: inspect git status before editing, preserve pre-existing user changes, and never use reset, checkout, clean, force-push, or recursive deletion unless the user explicitly requested that exact destructive operation. Do not commit or push unless requested."
+            .to_string(),
+    );
+    lines.push(
+        "Context guard: keep command, file, and search output focused. Never dump an entire large file or log into the conversation. Redirect verbose command output to a workspace file, then use search or targeted line ranges to inspect it. After each major milestone, update .catdesk/CURRENT_CONTEXT.md with the user's goal, completed work, key decisions, changed files, validation, and remaining work. Before continuing a long task or after reconnecting, read that checkpoint first."
+            .to_string(),
+    );
 
     if mode.computer_enabled() {
         lines.push("Use read to read files and search to search the workspace. Name every file you need in one read call.".to_string());
@@ -2106,7 +2588,11 @@ Always specify the branch explicitly when using `git push`."#
         }
         if tool_mode.write_tools_enabled() {
             lines.push(
-                "Use write with create_dirs=true to create files in new directories. Use edit for one or more guarded replace/range operations; the whole edit batch is atomic and range operations use 1-based inclusive line numbers plus exact old_text. Use plain mv commands for moves and renames. Use delete for other filesystem changes."
+                "Use apply_patch for code changes and multi-file edits. Use write with create_dirs=true for new files, and edit for small guarded replacements or line-range operations; an edit batch is atomic. Use plain mv commands for moves and renames. Use delete only for explicitly scoped workspace paths."
+                    .to_string(),
+            );
+            lines.push(
+                "Use the dedicated git_status, git_diff, git_log, git_add, and git_commit tools instead of shell Git commands when they cover the operation. Review the diff and validation result before staging or committing."
                     .to_string(),
             );
         }
@@ -2402,8 +2888,14 @@ fn tool_descriptor_should_attach_widget(name: &str) -> bool {
             | "catdesk_instruction"
             | "search"
             | "read"
+            | "git_status"
+            | "git_diff"
+            | "git_log"
+            | "git_add"
+            | "git_commit"
             | "write"
             | "edit"
+            | "apply_patch"
             | "delete"
     )
 }
@@ -3133,6 +3625,10 @@ fn change_scope_for_request(req: &JsonRpcRequest, workspace_root: &str) -> Chang
         "delete" => resolve(arguments.get("path").and_then(Value::as_str))
             .map(|path| ChangeScope::single(ChangeTarget::explicit(path, true)))
             .unwrap_or_else(ChangeScope::none),
+        "apply_patch" => ChangeScope::single(ChangeTarget::discovered(
+            Path::new(workspace_root).to_path_buf(),
+            true,
+        )),
         "run_command" => {
             let command_text = arguments
                 .get("command")
@@ -3178,8 +3674,11 @@ fn is_local_destructive_tool(tool_name: &str) -> bool {
             | "start_command"
             | "poll_command"
             | "cancel_command"
+            | "git_add"
+            | "git_commit"
             | "write"
             | "edit"
+            | "apply_patch"
             | "delete"
     )
 }
@@ -3599,6 +4098,33 @@ fn handle_delete_path(req: &JsonRpcRequest, workspace_root: &str) -> JsonRpcResp
 mod tests {
     use super::*;
     use uuid::Uuid;
+
+    fn run_git_for_test(root: &Path, args: &[&str]) -> String {
+        let output = std::process::Command::new("git")
+            .current_dir(root)
+            .args(args)
+            .output()
+            .expect("run git");
+        assert!(
+            output.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    }
+
+    fn init_git_workspace(name: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!("catdesk-mcp-git-{name}-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).expect("create git workspace");
+        run_git_for_test(&root, &["init", "-q"]);
+        run_git_for_test(&root, &["config", "user.name", "CatDesk Test"]);
+        run_git_for_test(
+            &root,
+            &["config", "user.email", "catdesk-test@example.invalid"],
+        );
+        root
+    }
 
     fn resources_list_request() -> JsonRpcRequest {
         JsonRpcRequest {
@@ -4219,8 +4745,14 @@ mod tests {
                 "catdesk_instruction",
                 "read",
                 "search",
+                "git_status",
+                "git_diff",
+                "git_log",
+                "git_add",
+                "git_commit",
                 "write",
                 "edit",
+                "apply_patch",
                 "delete",
             ]
         );
@@ -4571,7 +5103,17 @@ mod tests {
             .filter_map(|tool| tool.get("name").and_then(Value::as_str))
             .collect::<Vec<_>>();
 
-        assert_eq!(names, vec!["catdesk_instruction", "read", "search"]);
+        assert_eq!(
+            names,
+            vec![
+                "catdesk_instruction",
+                "read",
+                "search",
+                "git_status",
+                "git_diff",
+                "git_log",
+            ]
+        );
     }
 
     #[tokio::test]
@@ -4944,6 +5486,296 @@ mod tests {
         assert!(widget_payload.get("searchResults").is_none());
         assert!(widget_payload.get("searchQuery").is_none());
         assert!(widget_payload.get("filesScanned").is_none());
+
+        let _ = std::fs::remove_dir_all(workspace_root);
+    }
+
+    #[tokio::test]
+    async fn dedicated_git_tools_cover_status_diff_add_commit_and_log() {
+        let workspace_root = init_git_workspace("tool-flow");
+        std::fs::write(workspace_root.join("notes.txt"), "old\n").expect("write initial file");
+        run_git_for_test(&workspace_root, &["add", "notes.txt"]);
+        run_git_for_test(&workspace_root, &["commit", "-q", "-m", "initial"]);
+        std::fs::write(workspace_root.join("notes.txt"), "new\n").expect("modify file");
+        let workspace_root_str = workspace_root.to_string_lossy().into_owned();
+
+        let status = handle_git_status(
+            &tool_call_request("git_status", json!({})),
+            &workspace_root_str,
+        )
+        .await;
+        let status_stdout = status
+            .result
+            .as_ref()
+            .and_then(|result| result.get("structuredContent"))
+            .and_then(|structured| structured.get("stdout"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        assert!(status_stdout.contains("notes.txt"));
+
+        let diff = handle_git_diff(
+            &tool_call_request("git_diff", json!({})),
+            &workspace_root_str,
+        )
+        .await;
+        let diff_stdout = diff
+            .result
+            .as_ref()
+            .and_then(|result| result.get("structuredContent"))
+            .and_then(|structured| structured.get("stdout"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        assert!(diff_stdout.contains("-old"));
+        assert!(diff_stdout.contains("+new"));
+
+        let add = handle_git_add(
+            &tool_call_request("git_add", json!({ "paths": ["notes.txt"] })),
+            &workspace_root_str,
+        )
+        .await;
+        assert_ne!(
+            add.result
+                .as_ref()
+                .and_then(|result| result.get("isError"))
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+
+        let staged_diff = handle_git_diff(
+            &tool_call_request("git_diff", json!({ "staged": true })),
+            &workspace_root_str,
+        )
+        .await;
+        let staged_stdout = staged_diff
+            .result
+            .as_ref()
+            .and_then(|result| result.get("structuredContent"))
+            .and_then(|structured| structured.get("stdout"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        assert!(staged_stdout.contains("+new"));
+
+        // An empty repository-local identity masks any global identity and
+        // reproduces a service account that has never configured Git.
+        run_git_for_test(&workspace_root, &["config", "user.name", ""]);
+        run_git_for_test(&workspace_root, &["config", "user.email", ""]);
+
+        let commit = handle_git_commit(
+            &tool_call_request("git_commit", json!({ "message": "update notes" })),
+            &workspace_root_str,
+            true,
+        )
+        .await;
+        assert_ne!(
+            commit
+                .result
+                .as_ref()
+                .and_then(|result| result.get("isError"))
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+
+        let log = handle_git_log(
+            &tool_call_request("git_log", json!({ "max_count": 1 })),
+            &workspace_root_str,
+        )
+        .await;
+        let log_stdout = log
+            .result
+            .as_ref()
+            .and_then(|result| result.get("structuredContent"))
+            .and_then(|structured| structured.get("stdout"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        assert!(log_stdout.contains("update notes"));
+
+        let message = run_git_for_test(&workspace_root, &["log", "-1", "--format=%B"]);
+        assert!(message.contains(command::CATDESK_CO_AUTHOR_TRAILER));
+
+        let _ = std::fs::remove_dir_all(workspace_root);
+    }
+
+    #[tokio::test]
+    async fn git_write_tools_are_blocked_in_read_only_mode_and_reject_escape_paths() {
+        let workspace_root = init_git_workspace("read-only");
+        let workspace_root_str = workspace_root.to_string_lossy().into_owned();
+
+        let blocked = handle_tools_call(
+            &tool_call_request("git_add", json!({ "paths": ["."] })),
+            &workspace_root_str,
+            1,
+            Mode::Both,
+            ToolMode::ReadOnly,
+            false,
+            &CommandJobManager::new(),
+            &None,
+        )
+        .await;
+        assert_eq!(
+            blocked
+                .result
+                .as_ref()
+                .and_then(|result| result.get("isError"))
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+
+        let escaped = handle_git_add(
+            &tool_call_request("git_add", json!({ "paths": ["../outside.txt"] })),
+            &workspace_root_str,
+        )
+        .await;
+        assert_eq!(
+            escaped
+                .result
+                .as_ref()
+                .and_then(|result| result.get("isError"))
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+
+        let _ = std::fs::remove_dir_all(workspace_root);
+    }
+
+    #[tokio::test]
+    async fn apply_patch_updates_file_and_reports_changed_file() {
+        let workspace_root =
+            std::env::temp_dir().join(format!("catdesk-mcp-apply-patch-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&workspace_root).expect("create workspace");
+        std::fs::write(workspace_root.join("notes.txt"), "old\n").expect("write file");
+        let workspace_root_str = workspace_root.to_string_lossy().into_owned();
+        let req = tool_call_request(
+            "apply_patch",
+            json!({
+                "patch": "--- a/notes.txt\n+++ b/notes.txt\n@@ -1 +1 @@\n-old\n+new\n"
+            }),
+        );
+
+        let response = handle_tools_call(
+            &req,
+            &workspace_root_str,
+            1,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &CommandJobManager::new(),
+            &None,
+        )
+        .await;
+
+        assert_eq!(
+            std::fs::read_to_string(workspace_root.join("notes.txt")).expect("read file"),
+            "new\n"
+        );
+        assert_eq!(
+            response
+                .result
+                .as_ref()
+                .and_then(|result| result.get("structuredContent"))
+                .and_then(|structured| structured.get("success"))
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        let widget_payload = response
+            .result
+            .as_ref()
+            .and_then(|result| result.get("_meta"))
+            .and_then(|meta| meta.get(WIDGET_PAYLOAD_META_KEY))
+            .expect("missing widget payload");
+        assert_eq!(
+            widget_payload.get("hasChanges").and_then(Value::as_bool),
+            Some(true)
+        );
+        assert!(
+            widget_payload
+                .get("changedFiles")
+                .and_then(Value::as_array)
+                .is_some_and(|files| files
+                    .iter()
+                    .any(|file| { file.get("path").and_then(Value::as_str) == Some("notes.txt") }))
+        );
+
+        let _ = std::fs::remove_dir_all(workspace_root);
+    }
+
+    #[tokio::test]
+    async fn apply_patch_rejects_parent_directory_escape() {
+        let workspace_root =
+            std::env::temp_dir().join(format!("catdesk-mcp-apply-patch-escape-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&workspace_root).expect("create workspace");
+        let workspace_root_str = workspace_root.to_string_lossy().into_owned();
+        let req = tool_call_request(
+            "apply_patch",
+            json!({
+                "patch": "--- a/../outside.txt\n+++ b/../outside.txt\n@@ -1 +1 @@\n-old\n+new\n"
+            }),
+        );
+
+        let response = handle_apply_patch(&req, &workspace_root_str).await;
+        assert_eq!(
+            response
+                .result
+                .as_ref()
+                .and_then(|result| result.get("isError"))
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+
+        let _ = std::fs::remove_dir_all(workspace_root);
+    }
+
+    #[tokio::test]
+    async fn apply_patch_uses_cwd_and_checks_rename_metadata() {
+        let workspace_root =
+            std::env::temp_dir().join(format!("catdesk-mcp-apply-patch-cwd-{}", Uuid::new_v4()));
+        let repo = workspace_root.join("repo");
+        std::fs::create_dir_all(&repo).expect("create nested repo");
+        std::fs::write(repo.join("notes.txt"), "old\n").expect("write nested file");
+        let workspace_root_str = workspace_root.to_string_lossy().into_owned();
+
+        let applied = handle_apply_patch(
+            &tool_call_request(
+                "apply_patch",
+                json!({
+                    "cwd": "repo",
+                    "patch": "--- a/notes.txt\n+++ b/notes.txt\n@@ -1 +1 @@\n-old\n+new\n"
+                }),
+            ),
+            &workspace_root_str,
+        )
+        .await;
+        assert_ne!(
+            applied
+                .result
+                .as_ref()
+                .and_then(|result| result.get("isError"))
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            std::fs::read_to_string(repo.join("notes.txt")).unwrap(),
+            "new\n"
+        );
+
+        let escaped = handle_apply_patch(
+            &tool_call_request(
+                "apply_patch",
+                json!({
+                    "cwd": "repo",
+                    "patch": "diff --git a/notes.txt b/../outside.txt\nsimilarity index 100%\nrename from notes.txt\nrename to ../outside.txt\n"
+                }),
+            ),
+            &workspace_root_str,
+        )
+        .await;
+        assert_eq!(
+            escaped
+                .result
+                .as_ref()
+                .and_then(|result| result.get("isError"))
+                .and_then(Value::as_bool),
+            Some(true)
+        );
 
         let _ = std::fs::remove_dir_all(workspace_root);
     }
@@ -5637,6 +6469,21 @@ mod tests {
         "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n".repeat(bytes / 41 + 1)[..bytes].to_string()
     }
 
+    // Spend `bytes` of the read batch budget on pad files that each fit
+    // inside the per-file cap, and return their paths.
+    fn spend_read_budget(workspace_root: &Path, bytes: usize) -> Vec<String> {
+        let mut names = Vec::new();
+        let mut remaining = bytes;
+        while remaining > 0 {
+            let size = remaining.min(workspace_tools::MAX_READ_BYTES);
+            let name = format!("budget-pad-{}.txt", names.len());
+            std::fs::write(workspace_root.join(&name), filler(size)).expect("write pad file");
+            names.push(name);
+            remaining -= size;
+        }
+        names
+    }
+
     fn read_workspace(name: &str) -> PathBuf {
         let root = std::env::temp_dir().join(format!("catdesk-mcp-read-{name}-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&root).expect("create workspace");
@@ -5672,13 +6519,18 @@ mod tests {
     #[tokio::test]
     async fn read_tool_stops_reading_once_the_batch_budget_is_spent() {
         let workspace_root = read_workspace("batch-budget");
-        // The first file alone spends the whole budget, so the rest must come
-        // back with metadata and no text.
-        let names = ["a.txt", "b.txt", "c.txt"];
-        for name in names {
+        // Every file is capped at MAX_READ_BYTES, so the batch budget runs out
+        // after MAX_READ_BATCH_BYTES / MAX_READ_BYTES of them. Whatever the
+        // budget never reached must come back with metadata and no text.
+        let budget_files =
+            workspace_tools::MAX_READ_BATCH_BYTES / workspace_tools::MAX_READ_BYTES;
+        let names: Vec<String> = (0..budget_files + 2)
+            .map(|index| format!("f{index}.txt"))
+            .collect();
+        for name in &names {
             std::fs::write(
                 workspace_root.join(name),
-                filler(workspace_tools::MAX_READ_BATCH_BYTES),
+                filler(workspace_tools::MAX_READ_BYTES),
             )
             .expect("write file");
         }
@@ -5695,7 +6547,18 @@ mod tests {
             "combined text {total} exceeded the batch cap"
         );
         assert_eq!(structured["batchTruncated"], json!(true));
-        for skipped in &files[1..] {
+        let read_count = files
+            .iter()
+            .filter(|file| file["bytes"].as_u64().unwrap_or(0) > 0)
+            .count();
+        assert_eq!(
+            read_count, budget_files,
+            "the budget should cover exactly the files that fit inside it"
+        );
+        for skipped in files
+            .iter()
+            .filter(|file| file["bytes"].as_u64().unwrap_or(0) == 0)
+        {
             assert_eq!(
                 skipped["bytes"],
                 json!(0),
@@ -5784,7 +6647,7 @@ mod tests {
     #[tokio::test]
     async fn read_tool_does_not_let_an_unreadable_file_shrink_the_others() {
         let workspace_root = read_workspace("unreadable");
-        let big = workspace_tools::MAX_READ_BATCH_BYTES - 8192;
+        let big = workspace_tools::MAX_READ_BYTES - 8192;
         std::fs::write(workspace_root.join("app.js"), filler(big)).expect("write file");
         std::fs::write(workspace_root.join("locked.txt"), filler(100 * 1024)).expect("write file");
         use std::os::unix::fs::PermissionsExt;
@@ -5835,11 +6698,14 @@ mod tests {
     async fn read_tool_counts_lines_over_what_it_returned() {
         let workspace_root = read_workspace("lines");
         let cap = workspace_tools::MAX_READ_BATCH_BYTES;
-        std::fs::write(workspace_root.join("a.txt"), filler(cap - 1)).expect("write file");
+        // Spend all but one byte of the batch budget, so b.txt is admitted
+        // with a single byte of budget left.
+        let mut paths = spend_read_budget(&workspace_root, cap - 1);
         std::fs::write(workspace_root.join("b.txt"), "line\n".repeat(cap / 5 + 200))
             .expect("write file");
+        paths.push("b.txt".to_string());
 
-        let structured = read_batch(&workspace_root, json!(["a.txt", "b.txt"])).await;
+        let structured = read_batch(&workspace_root, json!(paths)).await;
         let b = structured["files"]
             .as_array()
             .unwrap()
@@ -5860,7 +6726,11 @@ mod tests {
     #[tokio::test]
     async fn read_tool_charges_one_file_once_however_many_times_it_is_named() {
         let workspace_root = read_workspace("dup");
-        std::fs::write(workspace_root.join("a.txt"), filler(300 * 1024)).expect("write file");
+        std::fs::write(
+            workspace_root.join("a.txt"),
+            filler(workspace_tools::MAX_READ_BYTES - 1024),
+        )
+        .expect("write file");
 
         let structured = read_batch(&workspace_root, json!(["a.txt", "a.txt"])).await;
         let files = structured["files"].as_array().expect("missing files");
@@ -5979,10 +6849,17 @@ mod tests {
     async fn read_tool_says_which_truncations_a_retry_would_fix() {
         let workspace_root = read_workspace("retryable");
         let cap = workspace_tools::MAX_READ_BATCH_BYTES;
-        std::fs::write(workspace_root.join("a.txt"), filler(cap - 1)).expect("write file");
-        std::fs::write(workspace_root.join("b.txt"), filler(cap + 4096)).expect("write file");
+        // Leave less budget than the per-file cap, so b.txt is cut by the
+        // batch budget here and by the per-file cap when it is read alone.
+        let mut paths = spend_read_budget(&workspace_root, cap - 1024);
+        std::fs::write(
+            workspace_root.join("b.txt"),
+            filler(workspace_tools::MAX_READ_BYTES + 4096),
+        )
+        .expect("write file");
+        paths.push("b.txt".to_string());
 
-        let structured = read_batch(&workspace_root, json!(["a.txt", "b.txt"])).await;
+        let structured = read_batch(&workspace_root, json!(paths)).await;
         let files = structured["files"].as_array().expect("missing files");
         let b = files
             .iter()
@@ -6041,8 +6918,8 @@ mod tests {
     #[tokio::test]
     async fn read_tool_heads_the_result_with_a_whole_file() {
         let workspace_root = read_workspace("head-whole");
-        let cap = workspace_tools::MAX_READ_BATCH_BYTES;
-        // Sorted smallest first, pad.txt is read whole and huge.txt gets a sliver.
+        let cap = workspace_tools::MAX_READ_BYTES;
+        // Sorted smallest first, pad.txt is read whole and huge.txt is cut.
         std::fs::write(workspace_root.join("pad.txt"), filler(cap - 4)).expect("write file");
         std::fs::write(workspace_root.join("huge.txt"), filler(cap + 4096)).expect("write file");
 

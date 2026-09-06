@@ -2,7 +2,10 @@ use std::path::{Path, PathBuf};
 use tree_sitter::{Node, Parser};
 use tree_sitter_bash::LANGUAGE as BASH_LANGUAGE;
 
-const MAX_BUFFER_BYTES: usize = 1024 * 1024;
+// Keep synchronous command responses small enough for ChatGPT's conversation
+// context. Callers that need long output should write it to a workspace file or
+// use the incremental start_command/poll_command path.
+const MAX_BUFFER_BYTES: usize = 32 * 1024;
 pub const DEFAULT_TIMEOUT_MS: u64 = 30_000;
 pub const MAX_TIMEOUT_MS: u64 = 120_000;
 pub const CATDESK_CO_AUTHOR_TRAILER: &str = "Co-Authored-By: CatDesk";
@@ -239,6 +242,152 @@ pub fn command_contains_git_commit(command: &str) -> bool {
     shell_segments(command)
         .iter()
         .any(|segment| segment_contains_git_commit(segment))
+}
+
+/// Reject common destructive shell operations that can erase or hide work.
+/// Dedicated, workspace-scoped tools remain available for intentional edits.
+pub fn blocked_destructive_command(command: &str) -> Option<&'static str> {
+    shell_segments(command)
+        .iter()
+        .find_map(|segment| blocked_destructive_segment(segment))
+}
+
+fn blocked_destructive_segment(segment: &str) -> Option<&'static str> {
+    if let Some(payload) = nested_shell_command(segment)
+        && let Some(reason) = blocked_destructive_command(&payload.command)
+    {
+        return Some(reason);
+    }
+
+    let words = shell_words(segment);
+    if let Some(git_idx) = command_start_git_index(&words)
+        && let Some(subcommand_idx) = git_subcommand_index(&words, git_idx)
+    {
+        let subcommand = words[subcommand_idx].lower.as_str();
+        if let Some(reason) = blocked_git_subcommand(subcommand, &words[subcommand_idx + 1..]) {
+            return Some(reason);
+        }
+        if subcommand == "push"
+            && words[subcommand_idx + 1..].iter().any(|word| {
+                word.lower == "-f"
+                    || word.lower == "--force"
+                    || word.lower.starts_with("--force-with-lease")
+            })
+        {
+            return Some("Force-push is blocked because it can rewrite remote history.");
+        }
+    }
+
+    let rm_idx = command_start_index(&words, |word| {
+        word.rsplit('/').next().unwrap_or(word) == "rm"
+    });
+    if let Some(rm_idx) = rm_idx
+        && words[rm_idx + 1..].iter().any(|word| {
+            word.lower == "--recursive"
+                || (word.lower.starts_with('-')
+                    && !word.lower.starts_with("--")
+                    && word.lower[1..].contains('r'))
+        })
+    {
+        return Some(
+            "Recursive shell deletion is blocked; use the workspace-scoped delete tool for an explicit path.",
+        );
+    }
+
+    None
+}
+
+/// True when any argument carries `flag` as a bundled short option, so `-fd`
+/// counts as both `-f` and `-d`. Case matters: `-D` and `-d` differ in Git.
+fn has_short_flag(args: &[ShellWord], flag: char) -> bool {
+    args.iter().any(|word| {
+        let text = word.text.as_str();
+        text.starts_with('-') && !text.starts_with("--") && text[1..].contains(flag)
+    })
+}
+
+fn has_arg(args: &[ShellWord], value: &str) -> bool {
+    args.iter().any(|word| word.lower == value)
+}
+
+/// Block only the Git forms that can discard committed or uncommitted work.
+/// Branch switching, unstaging and read-only inspection stay available,
+/// otherwise ordinary development becomes impossible through the tool.
+fn blocked_git_subcommand(subcommand: &str, args: &[ShellWord]) -> Option<&'static str> {
+    match subcommand {
+        "reset" if has_arg(args, "--hard") || has_arg(args, "--merge") || has_arg(args, "--keep") => {
+            Some(
+                "`git reset --hard/--merge/--keep` discards working-tree changes; use --soft or --mixed, or the dedicated file tools.",
+            )
+        }
+        // A pathspec turns checkout into "restore these files over whatever is
+        // in the working tree". Moving between branches is safe on its own:
+        // Git refuses the switch when it would lose changes.
+        "checkout"
+            if has_arg(args, "--")
+                || has_arg(args, ".")
+                || has_short_flag(args, 'f')
+                || has_arg(args, "--force") =>
+        {
+            Some(
+                "`git checkout` with a pathspec or --force discards working-tree changes; use `git checkout -b` or `git switch` to move between branches.",
+            )
+        }
+        // `git restore` is the same destructive operation under a newer name.
+        // Only the index-only form leaves the working tree alone.
+        "restore"
+            if !(has_arg(args, "--staged") || has_short_flag(args, 'S'))
+                || has_arg(args, "--worktree")
+                || has_short_flag(args, 'W') =>
+        {
+            Some(
+                "`git restore` discards working-tree changes; `git restore --staged` is allowed for unstaging.",
+            )
+        }
+        "clean" if !(has_arg(args, "--dry-run") || has_short_flag(args, 'n')) => Some(
+            "`git clean` deletes untracked files; use --dry-run to inspect, or the delete tool for an explicit path.",
+        ),
+        // Whitelist rather than blacklist: an unrecognised stash subcommand is
+        // far more likely to hide the working tree than to inspect it.
+        "stash"
+            if args.is_empty()
+                || !matches!(
+                    args[0].lower.as_str(),
+                    "list" | "show" | "apply" | "pop" | "branch"
+                ) =>
+        {
+            Some(
+                "`git stash` hides working-tree changes; `git stash list/show/apply/pop/branch` remain available.",
+            )
+        }
+        "branch"
+            if has_short_flag(args, 'D')
+                || (has_arg(args, "--delete")
+                    && (has_arg(args, "--force") || has_short_flag(args, 'f'))) =>
+        {
+            Some("`git branch -D` can drop unmerged commits; use `git branch -d` for a merged branch.")
+        }
+        _ => None,
+    }
+}
+
+fn git_subcommand_index(words: &[ShellWord], git_idx: usize) -> Option<usize> {
+    let mut idx = git_idx + 1;
+    while idx < words.len() {
+        match words[idx].lower.as_str() {
+            "-c" | "--git-dir" | "--work-tree" | "--namespace" => idx += 2,
+            value
+                if value.starts_with("--git-dir=")
+                    || value.starts_with("--work-tree=")
+                    || value.starts_with("--namespace=") =>
+            {
+                idx += 1
+            }
+            value if value.starts_with('-') => idx += 1,
+            _ => return Some(idx),
+        }
+    }
+    None
 }
 
 pub fn inject_catdesk_co_author_trailer(command: &str) -> String {
@@ -1051,6 +1200,39 @@ mod tests {
             "bash -lc 'git commit -m \"x\"'"
         ));
         assert!(!command_contains_git_commit("echo git commit"));
+    }
+
+    #[test]
+    fn blocks_destructive_git_and_recursive_delete_commands() {
+        assert!(blocked_destructive_command("git reset --hard").is_some());
+        assert!(blocked_destructive_command("git -C repo checkout -- file").is_some());
+        assert!(blocked_destructive_command("bash -lc 'git clean -fd'").is_some());
+        assert!(blocked_destructive_command("git push --force-with-lease origin main").is_some());
+        assert!(blocked_destructive_command("rm -rf build").is_some());
+        assert!(blocked_destructive_command("git restore src/main.rs").is_some());
+        assert!(blocked_destructive_command("git checkout .").is_some());
+        assert!(blocked_destructive_command("git stash").is_some());
+        assert!(blocked_destructive_command("git stash push -u").is_some());
+        assert!(blocked_destructive_command("git branch -D feature").is_some());
+
+        assert!(blocked_destructive_command("git status && git diff").is_none());
+        assert!(blocked_destructive_command("git push origin feature").is_none());
+        assert!(blocked_destructive_command("rm one-file.txt").is_none());
+    }
+
+    // Blocking a whole subcommand would also block the everyday, non-destructive
+    // spelling of it, which makes the tool unusable for real development.
+    #[test]
+    fn allows_non_destructive_forms_of_the_guarded_git_subcommands() {
+        assert!(blocked_destructive_command("git checkout -b feature").is_none());
+        assert!(blocked_destructive_command("git switch main").is_none());
+        assert!(blocked_destructive_command("git reset HEAD file.txt").is_none());
+        assert!(blocked_destructive_command("git reset --soft HEAD~1").is_none());
+        assert!(blocked_destructive_command("git restore --staged file.txt").is_none());
+        assert!(blocked_destructive_command("git clean --dry-run").is_none());
+        assert!(blocked_destructive_command("git clean -nd").is_none());
+        assert!(blocked_destructive_command("git stash list").is_none());
+        assert!(blocked_destructive_command("git branch -d merged").is_none());
     }
 
     #[test]

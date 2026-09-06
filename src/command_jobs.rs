@@ -23,7 +23,10 @@ const TERMINAL_JOB_TTL: StdDuration = StdDuration::from_secs(60 * 60);
 const IDEMPOTENCY_WINDOW: StdDuration = StdDuration::from_secs(30);
 const MAX_OUTPUT_BYTES_PER_JOB: usize = 4 * 1024 * 1024;
 const MAX_TERMINAL_OUTPUT_BYTES: usize = 32 * 1024 * 1024;
-const MAX_POLL_OUTPUT_BYTES: usize = 128 * 1024;
+// A poll response is duplicated in text and structured MCP content, so a large
+// page can consume conversation context surprisingly quickly. Preserve the
+// retained job output and let callers page through it with nextCursor.
+const MAX_POLL_OUTPUT_BYTES: usize = 32 * 1024;
 const READ_CHUNK_BYTES: usize = 8 * 1024;
 const CLEANUP_INTERVAL: StdDuration = StdDuration::from_secs(1);
 

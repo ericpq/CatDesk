@@ -11,13 +11,13 @@ use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
 
 /// Per-file cap; MAX_READ_BATCH_BYTES caps the whole batch.
-const MAX_READ_BYTES: usize = 512 * 1024;
+pub const MAX_READ_BYTES: usize = 32 * 1024;
 pub const MAX_READ_BATCH_FILES: usize = 32;
-pub const MAX_READ_BATCH_BYTES: usize = 512 * 1024;
+pub const MAX_READ_BATCH_BYTES: usize = 64 * 1024;
 const MAX_WRITE_BYTES: usize = 512 * 1024;
-const DEFAULT_LIST_LIMIT: usize = 200;
+const DEFAULT_LIST_LIMIT: usize = 100;
 const HARD_LIST_LIMIT: usize = 1000;
-const DEFAULT_SEARCH_LIMIT: usize = 100;
+const DEFAULT_SEARCH_LIMIT: usize = 50;
 const HARD_SEARCH_LIMIT: usize = 500;
 const HARD_SEARCH_CONTEXT_LINES: usize = 20;
 

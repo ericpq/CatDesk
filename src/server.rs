@@ -43,6 +43,12 @@ pub fn router(
     mcp_path: String,
     ui_events: UnboundedSender<ServerUiEvent>,
 ) -> Router {
+    // Reqwest is provider-neutral while ngrok selects AWS-LC. Install the
+    // shared process-level provider before either component initializes TLS.
+    // Repeated router construction in tests is harmless: an already-installed
+    // provider simply makes this return Err, which can be ignored.
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+
     let state = ServerState {
         app: app_state,
         devtools,
@@ -1686,7 +1692,7 @@ mod tests {
         }
         let (success, widgets) = tracked.expect("missing bootstrap tools/list event");
         assert!(success);
-        assert_eq!(widgets.len(), 10);
+        assert_eq!(widgets.len(), 16);
         assert_eq!(
             widgets
                 .iter()
@@ -1700,8 +1706,14 @@ mod tests {
                 "catdesk_instruction",
                 "read",
                 "search",
+                "git_status",
+                "git_diff",
+                "git_log",
+                "git_add",
+                "git_commit",
                 "write",
                 "edit",
+                "apply_patch",
                 "delete",
             ]
         );

@@ -99,7 +99,12 @@ fn insert_env_path(paths: &mut BTreeSet<PathBuf>, variable: &str) {
 fn runtime_read_paths() -> BTreeSet<PathBuf> {
     let mut paths = BTreeSet::new();
 
-    for path in ["/bin", "/sbin", "/usr", "/lib", "/lib64", "/etc", "/sys"] {
+    // `/proc` is required for process inspection tools such as ps, pgrep,
+    // top, and direct reads of process metadata. Keep it read-only: the
+    // separate write allowlist below does not include `/proc`.
+    for path in [
+        "/bin", "/sbin", "/usr", "/lib", "/lib64", "/etc", "/sys", "/proc",
+    ] {
         insert_existing(&mut paths, path);
     }
 
@@ -247,6 +252,18 @@ mod tests {
             .canonicalize()
             .expect("canonical /etc/resolv.conf");
         assert!(runtime_read_paths().contains(&resolv_conf));
+    }
+
+    #[test]
+    fn runtime_read_paths_include_proc() {
+        let proc = Path::new("/proc").canonicalize().expect("canonical /proc");
+        assert!(runtime_read_paths().contains(&proc));
+    }
+
+    #[test]
+    fn runtime_read_paths_do_not_include_filesystem_root() {
+        let root = Path::new("/").canonicalize().expect("canonical root");
+        assert!(!runtime_read_paths().contains(&root));
     }
 
     #[test]
