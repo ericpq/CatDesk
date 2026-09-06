@@ -9,6 +9,8 @@ use tiktoken_rs::o200k_base_singleton;
 use tokio::sync::Mutex;
 
 use crate::change_tracking::{ChangeScope, ChangeSession, ChangeTarget, FileChange};
+use crate::checkpoints;
+use crate::checks::{self, CheckKind};
 use crate::command;
 use crate::command_jobs::{
     CommandJobManager, CommandJobSnapshot, CommandJobState, DEFAULT_JOB_TIMEOUT_MS,
@@ -21,6 +23,11 @@ use crate::state::{
     load_app_config, user_home_dir,
 };
 use crate::workspace_tools;
+
+/// A test run is routinely slower than a shell command, so `run_checks`
+/// does not borrow `command`'s 120-second ceiling.
+const DEFAULT_CHECK_TIMEOUT_MS: u64 = checks::DEFAULT_TIMEOUT_MS;
+const MAX_CHECK_TIMEOUT_MS: u64 = checks::MAX_TIMEOUT_MS;
 
 const SERVER_NAME: &str = "catdesk";
 const SERVER_VERSION: &str = "4.0.0";
@@ -703,6 +710,100 @@ fn local_tool_output_schema(name: &str) -> Option<Value> {
                 }),
             );
         }
+        "run_checks" => {
+            for field in ["kind", "command", "cwd", "outputTail"] {
+                properties.insert(field.to_string(), json!({ "type": "string" }));
+            }
+            properties.insert(
+                "summary".to_string(),
+                json!({ "type": ["string", "null"] }),
+            );
+            for field in ["passed", "failed"] {
+                properties.insert(
+                    field.to_string(),
+                    json!({ "type": ["integer", "null"], "minimum": 0 }),
+                );
+            }
+            for field in ["durationMs", "outputBytes"] {
+                properties.insert(
+                    field.to_string(),
+                    json!({ "type": "integer", "minimum": 0 }),
+                );
+            }
+            properties.insert(
+                "exitCode".to_string(),
+                json!({ "type": ["integer", "null"] }),
+            );
+            for field in ["timedOut", "outputTailTruncated", "commandSuccess"] {
+                properties.insert(field.to_string(), json!({ "type": "boolean" }));
+            }
+            properties.insert(
+                "failures".to_string(),
+                json!({
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "name": { "type": "string" },
+                            "file": { "type": ["string", "null"] },
+                            "line": { "type": ["integer", "null"] },
+                            "message": { "type": ["string", "null"] }
+                        },
+                        "required": ["name"]
+                    }
+                }),
+            );
+            properties.insert(
+                "diagnostics".to_string(),
+                json!({
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "severity": { "type": "string" },
+                            "file": { "type": "string" },
+                            "line": { "type": "integer", "minimum": 0 },
+                            "column": { "type": ["integer", "null"] },
+                            "message": { "type": "string" }
+                        },
+                        "required": ["severity", "file", "line", "message"]
+                    }
+                }),
+            );
+        }
+        "checkpoint_list" => {
+            properties.insert(
+                "count".to_string(),
+                json!({ "type": "integer", "minimum": 0 }),
+            );
+            properties.insert(
+                "checkpoints".to_string(),
+                json!({
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "id": { "type": "string" },
+                            "tool": { "type": "string" },
+                            "createdAt": { "type": "string" },
+                            "paths": { "type": "array", "items": { "type": "string" } }
+                        },
+                        "required": ["id", "tool", "createdAt", "paths"]
+                    }
+                }),
+            );
+        }
+        "checkpoint_restore" => {
+            for field in ["checkpointId", "tool", "createdAt"] {
+                properties.insert(field.to_string(), json!({ "type": "string" }));
+            }
+            for field in ["restored", "removed", "skipped"] {
+                properties.insert(
+                    field.to_string(),
+                    json!({ "type": "array", "items": { "type": "string" } }),
+                );
+            }
+        }
         _ => return None,
     }
 
@@ -857,6 +958,21 @@ async fn handle_tools_list_with_show_detail_mode(
                 },
                 "annotations": { "readOnlyHint": false, "openWorldHint": false, "destructiveHint": true }
             }));
+            tools.push(json!({
+                "name": "run_checks",
+                "title": "Run checks",
+                "description": "Run the project's tests, build or type check and return the verdict: pass/fail counts, the failing test names, and file/line diagnostics. Prefer this over running the test command through run_command, whose output is capped at 32 KiB from the start and therefore drops the summary at the end.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "cwd": { "type": "string", "description": "Project directory relative to workspace root (default: workspace root)" },
+                        "kind": { "type": "string", "enum": ["cargo", "pytest", "go", "node", "generic"], "description": "Toolchain to parse the output as; detected from the project's marker files when omitted" },
+                        "command": { "type": "string", "description": "Command to run instead of the toolchain default (cargo test, python3 -m pytest -q, go test ./..., npm test)" },
+                        "timeout": { "type": "integer", "minimum": 1000, "maximum": MAX_CHECK_TIMEOUT_MS, "description": format!("Milliseconds to allow (default {DEFAULT_CHECK_TIMEOUT_MS}, maximum {MAX_CHECK_TIMEOUT_MS})") }
+                    }
+                },
+                "annotations": { "readOnlyHint": false, "openWorldHint": true, "destructiveHint": false }
+            }));
         }
 
         tools.push(catdesk_instruction_tool_descriptor());
@@ -944,6 +1060,14 @@ async fn handle_tools_list_with_show_detail_mode(
                     "path": { "type": "string", "description": "Optional path filter inside the repository" }
                 }
             },
+            "annotations": { "readOnlyHint": true, "openWorldHint": false, "destructiveHint": false }
+        }));
+
+        tools.push(json!({
+            "name": "checkpoint_list",
+            "title": "List checkpoints",
+            "description": "List the pre-images CatDesk recorded before recent write, edit, delete and apply_patch calls, newest first. Shell commands are not checkpointed.",
+            "inputSchema": { "type": "object", "properties": {} },
             "annotations": { "readOnlyHint": true, "openWorldHint": false, "destructiveHint": false }
         }));
 
@@ -1068,6 +1192,18 @@ async fn handle_tools_list_with_show_detail_mode(
                 },
                 "annotations": { "readOnlyHint": false, "openWorldHint": false, "destructiveHint": true }
             }));
+            tools.push(json!({
+                "name": "checkpoint_restore",
+                "title": "Restore checkpoint",
+                "description": "Undo an edit by putting the files back the way the named checkpoint found them. Defaults to the most recent checkpoint. Use this instead of reaching for git reset or checkout, which are blocked.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "checkpoint_id": { "type": "string", "description": "Checkpoint to restore; defaults to the most recent one" }
+                    }
+                },
+                "annotations": { "readOnlyHint": false, "openWorldHint": false, "destructiveHint": true }
+            }));
         }
     }
 
@@ -1141,6 +1277,10 @@ async fn handle_tools_call_with_show_detail_mode(
         .unwrap_or("")
         .to_string();
 
+    if mode.computer_enabled() && tool_mode.write_tools_enabled() {
+        capture_checkpoint_for_request(req, &tool_name, workspace_root);
+    }
+
     let change_session = (show_detail_mode != ShowDetailMode::Disable).then(|| {
         ChangeSession::begin(
             Path::new(workspace_root),
@@ -1162,7 +1302,7 @@ async fn handle_tools_call_with_show_detail_mode(
         } else if mode.computer_enabled() {
             if matches!(
                 tool_name.as_str(),
-                "run_command" | "start_command" | "poll_command" | "cancel_command"
+                "run_command" | "start_command" | "poll_command" | "cancel_command" | "run_checks"
             ) {
                 if tool_mode.run_command_enabled() {
                     match tool_name.as_str() {
@@ -1181,6 +1321,7 @@ async fn handle_tools_call_with_show_detail_mode(
                         }
                         "poll_command" => handle_poll_command(req, command_jobs).await,
                         "cancel_command" => handle_cancel_command(req, command_jobs).await,
+                        "run_checks" => handle_run_checks(req, workspace_root).await,
                         _ => unreachable!(),
                     }
                 } else if tool_mode.read_only() {
@@ -1195,6 +1336,7 @@ async fn handle_tools_call_with_show_detail_mode(
                     "git_status" => handle_git_status(req, workspace_root).await,
                     "git_diff" => handle_git_diff(req, workspace_root).await,
                     "git_log" => handle_git_log(req, workspace_root).await,
+                    "checkpoint_list" => handle_checkpoint_list(req, workspace_root),
                     _ => {
                         if tool_mode.write_tools_enabled() {
                             match tool_name.as_str() {
@@ -1207,6 +1349,9 @@ async fn handle_tools_call_with_show_detail_mode(
                                 "edit" => handle_edit_file(req, workspace_root),
                                 "apply_patch" => handle_apply_patch(req, workspace_root).await,
                                 "delete" => handle_delete_path(req, workspace_root),
+                                "checkpoint_restore" => {
+                                    handle_checkpoint_restore(req, workspace_root)
+                                }
                                 _ => {
                                     if mode.browser_enabled() {
                                         forward_to_devtools(req, &tool_name, tool_mode, devtools)
@@ -1909,6 +2054,301 @@ async fn handle_apply_patch(req: &JsonRpcRequest, workspace_root: &str) -> JsonR
     }
 }
 
+/// Snapshot the paths an editing tool names, so `checkpoint_restore` can undo
+/// it. Shell commands are deliberately not covered: what a command will touch
+/// is not knowable before it runs, and snapshotting the whole workspace on
+/// every call would cost far more than it saves.
+fn capture_checkpoint_for_request(req: &JsonRpcRequest, tool_name: &str, workspace_root: &str) {
+    let arguments = tool_arguments(req);
+    let paths: Vec<PathBuf> = match tool_name {
+        "write" | "edit" | "delete" => arguments
+            .get("path")
+            .and_then(Value::as_str)
+            .and_then(|path| command::resolve_workspace_path(workspace_root, Some(path)).ok())
+            .into_iter()
+            .collect(),
+        "apply_patch" => {
+            let Ok(cwd) = resolve_git_cwd(&arguments, workspace_root) else {
+                return;
+            };
+            let Some(patch) = arguments.get("patch").and_then(Value::as_str) else {
+                return;
+            };
+            patch_paths(patch)
+                .into_iter()
+                .filter(|raw| *raw != "/dev/null")
+                .map(|raw| {
+                    raw.strip_prefix("a/")
+                        .or_else(|| raw.strip_prefix("b/"))
+                        .unwrap_or(raw)
+                })
+                .filter_map(|path| {
+                    command::resolve_command_path(workspace_root, &cwd, Some(path)).ok()
+                })
+                .collect()
+        }
+        _ => return,
+    };
+    if paths.is_empty() {
+        return;
+    }
+    checkpoints::capture(Path::new(workspace_root), tool_name, &paths);
+}
+
+fn handle_checkpoint_list(req: &JsonRpcRequest, workspace_root: &str) -> JsonRpcResponse {
+    let recorded = checkpoints::list(Path::new(workspace_root));
+    let items: Vec<Value> = recorded
+        .iter()
+        .map(|checkpoint| {
+            json!({
+                "id": checkpoint.id,
+                "tool": checkpoint.tool,
+                "createdAt": checkpoint.created_at,
+                "paths": checkpoint.captured_paths(),
+            })
+        })
+        .collect();
+    let text = if recorded.is_empty() {
+        "No checkpoint has been recorded yet.".to_string()
+    } else {
+        recorded
+            .iter()
+            .map(|checkpoint| {
+                format!(
+                    "{}  {}  before {}  ({})",
+                    checkpoint.id,
+                    checkpoint.created_at,
+                    checkpoint.tool,
+                    checkpoint.captured_paths().join(", ")
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    tool_success_response_with_structured(
+        req,
+        text,
+        json!({
+            "toolName": "checkpoint_list",
+            "count": items.len(),
+            "checkpoints": items,
+        }),
+    )
+}
+
+fn handle_checkpoint_restore(req: &JsonRpcRequest, workspace_root: &str) -> JsonRpcResponse {
+    let arguments = tool_arguments(req);
+    let id = match optional_string_argument(&arguments, "checkpoint_id") {
+        Ok(value) => value,
+        Err(error) => return tool_error_response(req, error),
+    };
+    match checkpoints::restore(Path::new(workspace_root), id) {
+        Ok((checkpoint, report)) => {
+            let mut text = format!(
+                "Restored the workspace to the checkpoint taken before {} at {}.",
+                checkpoint.tool, checkpoint.created_at
+            );
+            if !report.restored.is_empty() {
+                text.push_str(&format!("\nRestored: {}", report.restored.join(", ")));
+            }
+            if !report.removed.is_empty() {
+                text.push_str(&format!("\nRemoved: {}", report.removed.join(", ")));
+            }
+            if !report.skipped.is_empty() {
+                // A skipped path was never captured, so the caller must not
+                // read this as "the whole edit was undone".
+                text.push_str(&format!(
+                    "\nNot restored (never captured): {}",
+                    report.skipped.join(", ")
+                ));
+            }
+            tool_success_response_with_structured(
+                req,
+                text,
+                json!({
+                    "toolName": "checkpoint_restore",
+                    "checkpointId": checkpoint.id,
+                    "tool": checkpoint.tool,
+                    "createdAt": checkpoint.created_at,
+                    "restored": report.restored,
+                    "removed": report.removed,
+                    "skipped": report.skipped,
+                }),
+            )
+        }
+        Err(error) => tool_error_response(req, error),
+    }
+}
+
+async fn handle_run_checks(req: &JsonRpcRequest, workspace_root: &str) -> JsonRpcResponse {
+    let arguments = tool_arguments(req);
+    let cwd = match resolve_git_cwd(&arguments, workspace_root) {
+        Ok(cwd) => cwd,
+        Err(error) => return tool_error_response(req, error),
+    };
+    let kind = match optional_string_argument(&arguments, "kind") {
+        Ok(Some(value)) => match CheckKind::parse(value) {
+            Some(kind) => kind,
+            None => {
+                return tool_error_response(
+                    req,
+                    format!("Unknown check kind: {value}. Use cargo, pytest, go, node or generic."),
+                );
+            }
+        },
+        Ok(None) => CheckKind::detect(&cwd),
+        Err(error) => return tool_error_response(req, error),
+    };
+    let command_text = match optional_string_argument(&arguments, "command") {
+        Ok(Some(value)) => value.to_string(),
+        Ok(None) => match kind.default_command() {
+            Some(default) => default.to_string(),
+            None => {
+                return tool_error_response(
+                    req,
+                    "No check command could be inferred for this directory; pass command explicitly."
+                        .into(),
+                );
+            }
+        },
+        Err(error) => return tool_error_response(req, error),
+    };
+    if let Some(reason) = command::blocked_destructive_command(&command_text) {
+        return tool_error_response(req, reason.into());
+    }
+    let timeout_ms = match optional_usize_argument(&arguments, "timeout") {
+        Ok(Some(value)) => (value as u64).clamp(1_000, MAX_CHECK_TIMEOUT_MS),
+        Ok(None) => DEFAULT_CHECK_TIMEOUT_MS,
+        Err(error) => return tool_error_response(req, error),
+    };
+
+    // A check is run for its verdict, not its transcript. Capture generously
+    // here and hand back the parsed result plus a bounded tail.
+    let result = crate::process_runner::run_shell_command(
+        &command_text,
+        Path::new(workspace_root),
+        &cwd,
+        timeout_ms,
+        checks::MAX_CAPTURE_BYTES,
+    )
+    .await;
+
+    let outcome = checks::parse(kind, &result.stdout, &result.stderr);
+    let mut transcript = result.stdout.clone();
+    if !result.stderr.is_empty() {
+        if !transcript.is_empty() {
+            transcript.push('\n');
+        }
+        transcript.push_str(&result.stderr);
+    }
+    let (tail, tail_truncated) = checks::output_tail(&transcript);
+
+    let failures: Vec<Value> = outcome
+        .failures
+        .iter()
+        .map(|failure| {
+            json!({
+                "name": failure.name,
+                "file": failure.file,
+                "line": failure.line,
+                "message": failure.message,
+            })
+        })
+        .collect();
+    let diagnostics: Vec<Value> = outcome
+        .diagnostics
+        .iter()
+        .map(|diagnostic| {
+            json!({
+                "severity": diagnostic.severity,
+                "file": diagnostic.file,
+                "line": diagnostic.line,
+                "column": diagnostic.column,
+                "message": diagnostic.message,
+            })
+        })
+        .collect();
+
+    // A runner can exit non-zero for reasons the parser did not see, and in
+    // principle exit zero with failures in its output. Treat both as failing.
+    let verdict = result.success && outcome.failed.unwrap_or(0) == 0;
+    let mut text = format!(
+        "{} ({}) {} - exited {} in {} ms",
+        command_text,
+        kind.as_str(),
+        if verdict { "PASSED" } else { "FAILED" },
+        result
+            .exit_code
+            .map(|code| code.to_string())
+            .unwrap_or_else(|| "?".to_string()),
+        result.elapsed_ms
+    );
+    if result.timed_out {
+        text.push_str(&format!(" (timed out after {timeout_ms} ms)"));
+    }
+    if let Some(summary) = outcome.summary.as_deref() {
+        text.push('\n');
+        text.push_str(summary);
+    }
+    for failure in outcome.failures.iter().take(20) {
+        text.push_str(&format!("\nFAIL {}", failure.name));
+        if let Some(file) = failure.file.as_deref() {
+            text.push_str(&format!(
+                "\n  {}:{}",
+                file,
+                failure
+                    .line
+                    .map(|line| line.to_string())
+                    .unwrap_or_else(|| "?".to_string())
+            ));
+        }
+        if let Some(message) = failure.message.as_deref() {
+            text.push_str(&format!("\n  {message}"));
+        }
+    }
+    for diagnostic in outcome.diagnostics.iter().take(20) {
+        text.push_str(&format!(
+            "\n{} {}:{} {}",
+            diagnostic.severity, diagnostic.file, diagnostic.line, diagnostic.message
+        ));
+    }
+    // Nothing could be parsed, so the raw tail is the only signal there is.
+    if outcome.failures.is_empty() && outcome.diagnostics.is_empty() && outcome.summary.is_none() {
+        text.push_str("\n--- output tail ---\n");
+        text.push_str(&tail);
+    }
+
+    let structured = json!({
+        "toolName": "run_checks",
+        "kind": kind.as_str(),
+        "command": command_text.clone(),
+        "cwd": cwd.to_string_lossy(),
+        "exitCode": result.exit_code,
+        "success": verdict,
+        "commandSuccess": result.success,
+        "timedOut": result.timed_out,
+        "durationMs": result.elapsed_ms,
+        "passed": outcome.passed,
+        "failed": outcome.failed,
+        "failures": failures,
+        "diagnostics": diagnostics,
+        "summary": outcome.summary.clone(),
+        "outputTail": tail,
+        "outputTailTruncated": tail_truncated,
+        "outputBytes": transcript.len(),
+    });
+
+    // Only a run that produced no verdict at all is a tool error: 127 is the
+    // shell saying the command does not exist, and a timeout means the run
+    // never finished. A red test run is a successful call with a red verdict.
+    let produced_a_verdict = result.exit_code != Some(127) && !result.timed_out;
+    if produced_a_verdict {
+        tool_success_response_with_structured(req, text, structured)
+    } else {
+        tool_error_response_with_structured(req, text, structured)
+    }
+}
+
 fn patch_paths(patch: &str) -> Vec<&str> {
     let mut paths = Vec::new();
     for line in patch.lines() {
@@ -2595,6 +3035,14 @@ Always specify the branch explicitly when using `git push`."#
                 "Use the dedicated git_status, git_diff, git_log, git_add, and git_commit tools instead of shell Git commands when they cover the operation. Review the diff and validation result before staging or committing."
                     .to_string(),
             );
+            lines.push(
+                "Use run_checks to run tests, builds and type checks. It returns pass/fail counts, the failing test names and file/line diagnostics, so a failure can be acted on directly instead of read out of a transcript."
+                    .to_string(),
+            );
+            lines.push(
+                "write, edit, delete and apply_patch record the files they touch first: checkpoint_list shows those recordings and checkpoint_restore undoes one. Shell commands are not recorded, so make changes through the editing tools when an undo may be needed."
+                    .to_string(),
+            );
         }
     }
 
@@ -2881,7 +3329,10 @@ fn attach_tool_call_count(result: &mut Value, tool_call_count: u64) {
 fn tool_descriptor_should_attach_widget(name: &str) -> bool {
     matches!(
         name,
-        "run_command"
+        "run_checks"
+            | "checkpoint_list"
+            | "checkpoint_restore"
+            | "run_command"
             | "start_command"
             | "poll_command"
             | "cancel_command"
@@ -3625,7 +4076,7 @@ fn change_scope_for_request(req: &JsonRpcRequest, workspace_root: &str) -> Chang
         "delete" => resolve(arguments.get("path").and_then(Value::as_str))
             .map(|path| ChangeScope::single(ChangeTarget::explicit(path, true)))
             .unwrap_or_else(ChangeScope::none),
-        "apply_patch" => ChangeScope::single(ChangeTarget::discovered(
+        "apply_patch" | "checkpoint_restore" => ChangeScope::single(ChangeTarget::discovered(
             Path::new(workspace_root).to_path_buf(),
             true,
         )),
@@ -3670,7 +4121,9 @@ fn change_scope_for_request(req: &JsonRpcRequest, workspace_root: &str) -> Chang
 fn is_local_destructive_tool(tool_name: &str) -> bool {
     matches!(
         tool_name,
-        "run_command"
+        "run_checks"
+            | "checkpoint_restore"
+            | "run_command"
             | "start_command"
             | "poll_command"
             | "cancel_command"
@@ -4742,18 +5195,21 @@ mod tests {
                 "start_command",
                 "poll_command",
                 "cancel_command",
+                "run_checks",
                 "catdesk_instruction",
                 "read",
                 "search",
                 "git_status",
                 "git_diff",
                 "git_log",
+                "checkpoint_list",
                 "git_add",
                 "git_commit",
                 "write",
                 "edit",
                 "apply_patch",
                 "delete",
+                "checkpoint_restore",
             ]
         );
     }
@@ -5112,6 +5568,7 @@ mod tests {
                 "git_status",
                 "git_diff",
                 "git_log",
+                "checkpoint_list",
             ]
         );
     }

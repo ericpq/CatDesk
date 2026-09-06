@@ -1,6 +1,8 @@
 mod binagotchy_gen;
 mod browser;
 mod change_tracking;
+mod checkpoints;
+mod checks;
 mod command;
 mod command_jobs;
 mod devtools;

@@ -1692,7 +1692,7 @@ mod tests {
         }
         let (success, widgets) = tracked.expect("missing bootstrap tools/list event");
         assert!(success);
-        assert_eq!(widgets.len(), 16);
+        assert_eq!(widgets.len(), 19);
         assert_eq!(
             widgets
                 .iter()
@@ -1703,18 +1703,21 @@ mod tests {
                 "start_command",
                 "poll_command",
                 "cancel_command",
+                "run_checks",
                 "catdesk_instruction",
                 "read",
                 "search",
                 "git_status",
                 "git_diff",
                 "git_log",
+                "checkpoint_list",
                 "git_add",
                 "git_commit",
                 "write",
                 "edit",
                 "apply_patch",
                 "delete",
+                "checkpoint_restore",
             ]
         );
         assert!(widgets.iter().all(|widget| {
