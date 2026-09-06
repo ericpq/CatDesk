@@ -281,7 +281,9 @@ fn parse_pytest(text: &str) -> CheckOutcome {
     if let Some(summary) = text
         .lines()
         .rev()
-        .find(|line| line.contains(" passed") || line.contains(" failed") || line.contains(" error"))
+        .find(|line| {
+            line.contains(" passed") || line.contains(" failed") || line.contains(" error")
+        })
         .filter(|line| PYTEST_COUNT.is_match(line))
     {
         let (mut passed, mut failed) = (0u32, 0u32);
@@ -359,9 +361,8 @@ fn parse_go(text: &str) -> CheckOutcome {
     outcome
 }
 
-static NODE_SUMMARY: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"Tests:?\s+(.*)$").expect("node summary")
-});
+static NODE_SUMMARY: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"Tests:?\s+(.*)$").expect("node summary"));
 static NODE_COUNT: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(\d+) (passed|failed)").expect("node counts"));
 static NODE_FAILURE: LazyLock<Regex> =
@@ -489,10 +490,7 @@ error: could not compile `catdesk` (bin \"catdesk\") due to 1 previous error
         assert_eq!(diagnostic.file, "src/mcp.rs");
         assert_eq!(diagnostic.line, 1822);
         assert_eq!(diagnostic.column, Some(5));
-        assert_eq!(
-            diagnostic.message,
-            "cannot find value `nope` in this scope"
-        );
+        assert_eq!(diagnostic.message, "cannot find value `nope` in this scope");
     }
 
     #[test]
@@ -507,7 +505,10 @@ ERROR tests/test_setup.py::test_fixture
         assert_eq!(outcome.passed, Some(12));
         assert_eq!(outcome.failed, Some(2));
         assert_eq!(outcome.failures.len(), 2);
-        assert_eq!(outcome.failures[0].name, "tests/test_billing.py::test_refund");
+        assert_eq!(
+            outcome.failures[0].name,
+            "tests/test_billing.py::test_refund"
+        );
         assert_eq!(
             outcome.failures[0].file.as_deref(),
             Some("tests/test_billing.py")
@@ -586,10 +587,8 @@ Tests:       1 failed, 5 passed, 6 total
 
     #[test]
     fn detection_prefers_an_unambiguous_toolchain_marker() {
-        let root = std::env::temp_dir().join(format!(
-            "catdesk-checks-detect-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("catdesk-checks-detect-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&root).expect("create dir");
         std::fs::write(root.join("package.json"), "{}").expect("write package.json");
         assert_eq!(CheckKind::detect(&root), CheckKind::Node);

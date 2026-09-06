@@ -719,10 +719,7 @@ fn local_tool_output_schema(name: &str) -> Option<Value> {
             for field in ["kind", "command", "cwd", "outputTail"] {
                 properties.insert(field.to_string(), json!({ "type": "string" }));
             }
-            properties.insert(
-                "summary".to_string(),
-                json!({ "type": ["string", "null"] }),
-            );
+            properties.insert("summary".to_string(), json!({ "type": ["string", "null"] }));
             for field in ["passed", "failed"] {
                 properties.insert(
                     field.to_string(),
@@ -2277,9 +2274,7 @@ fn handle_outline(req: &JsonRpcRequest, workspace_root: &str) -> JsonRpcResponse
         "truncated": truncated,
         "outlineText": outline::render(&symbols),
     });
-    if include_symbols
-        && let Some(object) = structured.as_object_mut()
-    {
+    if include_symbols && let Some(object) = structured.as_object_mut() {
         object.insert(
             "symbols".to_string(),
             json!(symbols.iter().map(symbol_json).collect::<Vec<_>>()),
@@ -2338,7 +2333,11 @@ fn handle_find_symbol(req: &JsonRpcRequest, workspace_root: &str) -> JsonRpcResp
             .map(|hit| {
                 format!(
                     "{}:{}  {} {}\n  {}",
-                    hit.path, hit.symbol.line, hit.symbol.kind, hit.symbol.name, hit.symbol.signature
+                    hit.path,
+                    hit.symbol.line,
+                    hit.symbol.kind,
+                    hit.symbol.name,
+                    hit.symbol.signature
                 )
             })
             .collect::<Vec<_>>()
@@ -7310,8 +7309,7 @@ mod tests {
         // Every file is capped at MAX_READ_BYTES, so the batch budget runs out
         // after MAX_READ_BATCH_BYTES / MAX_READ_BYTES of them. Whatever the
         // budget never reached must come back with metadata and no text.
-        let budget_files =
-            workspace_tools::MAX_READ_BATCH_BYTES / workspace_tools::MAX_READ_BYTES;
+        let budget_files = workspace_tools::MAX_READ_BATCH_BYTES / workspace_tools::MAX_READ_BYTES;
         let names: Vec<String> = (0..budget_files + 2)
             .map(|index| format!("f{index}.txt"))
             .collect();

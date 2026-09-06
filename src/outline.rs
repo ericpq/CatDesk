@@ -293,12 +293,7 @@ pub fn render(symbols: &[Symbol]) -> String {
         .join("\n")
 }
 
-pub fn find_in_source(
-    source: &str,
-    language: Language,
-    needle: &str,
-    exact: bool,
-) -> Vec<Symbol> {
+pub fn find_in_source(source: &str, language: Language, needle: &str, exact: bool) -> Vec<Symbol> {
     outline(source, language, HARD_MAX_SYMBOLS)
         .into_iter()
         .filter(|symbol| {
@@ -329,7 +324,11 @@ pub fn find_symbol(
     let mut searched = 0usize;
     let mut truncated = false;
 
-    for entry in ignore::WalkBuilder::new(root).hidden(true).build().flatten() {
+    for entry in ignore::WalkBuilder::new(root)
+        .hidden(true)
+        .build()
+        .flatten()
+    {
         if matches.len() >= max_matches || searched >= MAX_SEARCHED_FILES {
             truncated = true;
             break;
@@ -472,7 +471,10 @@ def audit(ledger):
 ";
         let symbols = outline(source, Language::Python, DEFAULT_MAX_SYMBOLS);
 
-        assert_eq!(names(&symbols), vec!["Ledger", "__init__", "total", "audit"]);
+        assert_eq!(
+            names(&symbols),
+            vec!["Ledger", "__init__", "total", "audit"]
+        );
         assert_eq!(symbols[1].depth, 1);
         assert_eq!(symbols[3].depth, 0);
     }
@@ -539,8 +541,14 @@ func Audit(l *Ledger) bool {
 
     #[test]
     fn languages_are_recognised_by_extension() {
-        assert_eq!(Language::from_path(Path::new("a/b.rs")), Some(Language::Rust));
-        assert_eq!(Language::from_path(Path::new("a/b.tsx")), Some(Language::Tsx));
+        assert_eq!(
+            Language::from_path(Path::new("a/b.rs")),
+            Some(Language::Rust)
+        );
+        assert_eq!(
+            Language::from_path(Path::new("a/b.tsx")),
+            Some(Language::Tsx)
+        );
         assert_eq!(
             Language::from_path(Path::new("a/b.TS")),
             Some(Language::TypeScript)
@@ -550,10 +558,8 @@ func Audit(l *Ledger) bool {
 
     #[test]
     fn a_workspace_search_reports_the_path_relative_to_the_workspace() {
-        let root = std::env::temp_dir().join(format!(
-            "catdesk-outline-search-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("catdesk-outline-search-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(root.join("src")).expect("create tree");
         std::fs::write(root.join("src/ledger.rs"), RUST_SOURCE).expect("write source");
         std::fs::write(root.join("src/notes.md"), "fn audit() {}").expect("write note");

@@ -315,7 +315,9 @@ fn has_arg(args: &[ShellWord], value: &str) -> bool {
 /// otherwise ordinary development becomes impossible through the tool.
 fn blocked_git_subcommand(subcommand: &str, args: &[ShellWord]) -> Option<&'static str> {
     match subcommand {
-        "reset" if has_arg(args, "--hard") || has_arg(args, "--merge") || has_arg(args, "--keep") => {
+        "reset"
+            if has_arg(args, "--hard") || has_arg(args, "--merge") || has_arg(args, "--keep") =>
+        {
             Some(
                 "`git reset --hard/--merge/--keep` discards working-tree changes; use --soft or --mixed, or the dedicated file tools.",
             )
@@ -365,7 +367,9 @@ fn blocked_git_subcommand(subcommand: &str, args: &[ShellWord]) -> Option<&'stat
                 || (has_arg(args, "--delete")
                     && (has_arg(args, "--force") || has_short_flag(args, 'f'))) =>
         {
-            Some("`git branch -D` can drop unmerged commits; use `git branch -d` for a merged branch.")
+            Some(
+                "`git branch -D` can drop unmerged commits; use `git branch -d` for a merged branch.",
+            )
         }
         _ => None,
     }

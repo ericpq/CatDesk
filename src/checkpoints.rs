@@ -175,8 +175,10 @@ fn collect(
         // A directory is only ever recursed into, never recorded itself, so the
         // empty relative path of the workspace root stops here.
         // Sorted so a checkpoint of the same directory is reproducible.
-        let mut child_paths: Vec<PathBuf> =
-            children.filter_map(|entry| entry.ok()).map(|e| e.path()).collect();
+        let mut child_paths: Vec<PathBuf> = children
+            .filter_map(|entry| entry.ok())
+            .map(|e| e.path())
+            .collect();
         child_paths.sort();
         for child in child_paths {
             collect(workspace_root, &child, entries, total_bytes);
@@ -200,7 +202,13 @@ fn collect(
         return;
     }
     *total_bytes += size;
-    entries.push((relative, EntryKind::File, Some(path.to_path_buf()), size, None));
+    entries.push((
+        relative,
+        EntryKind::File,
+        Some(path.to_path_buf()),
+        size,
+        None,
+    ));
 }
 
 /// Record the current state of `paths` and return the stored checkpoint.
@@ -318,7 +326,10 @@ fn prune(workspace_root: &Path) {
 }
 
 /// Put the workspace back the way `id` (or the newest checkpoint) found it.
-pub fn restore(workspace_root: &Path, id: Option<&str>) -> Result<(Checkpoint, RestoreReport), String> {
+pub fn restore(
+    workspace_root: &Path,
+    id: Option<&str>,
+) -> Result<(Checkpoint, RestoreReport), String> {
     let checkpoints = list(workspace_root);
     let checkpoint = match id {
         Some(id) => checkpoints
