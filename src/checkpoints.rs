@@ -56,6 +56,11 @@ pub struct Checkpoint {
     pub tool: String,
     pub created_at: String,
     pub created_at_ms: u64,
+    /// Monotonic within a workspace, so "the newest checkpoint" has an answer
+    /// even for two edits made in the same millisecond. Manifests written
+    /// before this field existed deserialise to 0.
+    #[serde(default)]
+    pub seq: u64,
     pub entries: Vec<CheckpointEntry>,
 }
 
@@ -230,6 +235,14 @@ pub fn capture(workspace_root: &Path, tool: &str, paths: &[PathBuf]) -> Option<C
     }
 
     let (created_at, created_at_ms) = now();
+    // Milliseconds are not a fine enough tiebreaker for two edits this close
+    // together, and a clock stepped backwards would order them wrongly.
+    let seq = list(workspace_root)
+        .iter()
+        .map(|checkpoint| checkpoint.seq)
+        .max()
+        .unwrap_or(0)
+        + 1;
     let id = uuid::Uuid::new_v4().to_string();
     let directory = checkpoints_root(workspace_root).join(&id);
     let blobs = directory.join("blobs");
@@ -265,6 +278,7 @@ pub fn capture(workspace_root: &Path, tool: &str, paths: &[PathBuf]) -> Option<C
         tool: tool.to_string(),
         created_at,
         created_at_ms,
+        seq,
         entries,
     };
     let manifest = match serde_json::to_string_pretty(&checkpoint) {
@@ -291,7 +305,15 @@ pub fn list(workspace_root: &Path) -> Vec<Checkpoint> {
             serde_json::from_str::<Checkpoint>(&manifest).ok()
         })
         .collect();
-    checkpoints.sort_by(|left, right| right.created_at_ms.cmp(&left.created_at_ms));
+    // Newest first. The sequence decides it; the timestamp and id only order
+    // manifests from before the sequence existed, which all carry seq 0.
+    checkpoints.sort_by(|left, right| {
+        right
+            .seq
+            .cmp(&left.seq)
+            .then(right.created_at_ms.cmp(&left.created_at_ms))
+            .then(right.id.cmp(&left.id))
+    });
     checkpoints
 }
 
@@ -473,6 +495,32 @@ mod tests {
         let (used, _) = restore(&root, Some(&first.id)).expect("restore by id");
         assert_eq!(used.id, first.id);
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "one\n");
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn two_checkpoints_taken_in_the_same_millisecond_still_order_by_creation() {
+        let root = workspace("same-millisecond");
+        let file = root.join("notes.txt");
+        std::fs::write(&file, "one\n").expect("seed");
+
+        let first = capture(&root, "write", &[file.clone()]).expect("first checkpoint");
+        let second = capture(&root, "write", &[file.clone()]).expect("second checkpoint");
+
+        // These two land close enough together that their millisecond stamps
+        // can be equal, which is what used to make the order arbitrary.
+        assert!(
+            second.seq > first.seq,
+            "sequence did not advance: {} then {}",
+            first.seq,
+            second.seq
+        );
+        assert_eq!(
+            list(&root)[0].id,
+            second.id,
+            "newest checkpoint comes first"
+        );
 
         let _ = std::fs::remove_dir_all(root);
     }
