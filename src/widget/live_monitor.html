@@ -32,16 +32,13 @@
       }
       #app { padding: 16px 18px 14px; max-width: 720px; margin: 0 auto; }
       .head {
-        display: flex;
-        align-items: flex-end;
-        justify-content: space-between;
+        display: flex; align-items: flex-end; justify-content: space-between;
         margin-bottom: 14px;
       }
       .state { display: flex; align-items: center; gap: 9px; }
       #dot {
         width: 10px; height: 10px; border-radius: 50%;
-        background: var(--idle); flex: none;
-        transition: background 0.25s ease;
+        background: var(--idle); flex: none; transition: background 0.2s ease;
       }
       body[data-busy="1"] #dot {
         background: var(--busy);
@@ -56,36 +53,42 @@
       #state { font-size: 14px; font-weight: 500; }
       #clock {
         font: 500 30px/1 var(--mono);
-        font-variant-numeric: tabular-nums;
-        letter-spacing: -0.02em;
+        font-variant-numeric: tabular-nums; letter-spacing: -0.02em;
+        transition: color 0.2s ease;
       }
+      body[data-busy="0"] #clock { color: var(--faint); font-size: 15px; }
       #graph {
-        display: flex; align-items: flex-end; gap: 2px;
-        height: 48px; padding-bottom: 2px;
-        border-bottom: 1px solid var(--line); margin-bottom: 14px;
+        display: flex; align-items: flex-end; gap: 2px; height: 48px;
+        padding-bottom: 2px; border-bottom: 1px solid var(--line);
+        margin-bottom: 14px;
       }
       #graph span {
         flex: 1; border-radius: 1px 1px 0 0; background: #232a36; height: 8%;
-        transition: height 0.3s ease, background 0.3s ease;
+        transition: height 0.25s ease, background 0.25s ease;
       }
       .card {
         background: var(--panel); border-radius: 8px;
         padding: 11px 13px; margin-bottom: 12px;
+        transition: opacity 0.2s ease;
       }
-      .card.empty { opacity: 0.45; }
-      .cap {
-        font-size: 11px; letter-spacing: 0.06em; color: var(--faint);
-      }
+      .card.empty { opacity: 0.4; }
+      .cap { font-size: 11px; letter-spacing: 0.06em; color: var(--faint); }
       .now { display: flex; align-items: center; gap: 8px; margin-bottom: 5px; }
       #tool { font-weight: 500; font-size: 13px; }
       #detail {
         font: 400 12px/1.4 var(--mono); color: var(--dim);
         overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+        min-height: 17px;
       }
       #recent { margin-top: 7px; }
       .row {
         display: flex; align-items: center; gap: 9px;
         padding: 5px 0; border-bottom: 1px solid var(--hair);
+      }
+      .row.fresh { animation: land 0.5s ease-out; }
+      @keyframes land {
+        from { background: rgba(91, 157, 255, 0.12); }
+        to { background: transparent; }
       }
       .rdot { width: 6px; height: 6px; border-radius: 50%; flex: none; }
       .rtool { flex: none; font-size: 12px; font-weight: 500; }
@@ -108,9 +111,7 @@
       .stat div:last-child {
         font: 500 15px var(--mono); font-variant-numeric: tabular-nums;
       }
-      #err {
-        display: none; margin-top: 10px; font-size: 12px; color: var(--bad);
-      }
+      #err { display: none; margin-top: 10px; font-size: 12px; color: var(--bad); }
       body[data-conn="0"] #err { display: block; }
     </style>
   </head>
@@ -137,19 +138,21 @@
         <div class="stat"><div>本次会话</div><div id="s-session">—</div></div>
       </div>
 
-      <div id="err">连接断开，正在重试…</div>
+      <div id="err">连接断开，正在重连…</div>
     </div>
 
     <script>
       (function () {
-        // The page is served next to the endpoint it reads, so it never needs
-        // the secret prefix hardcoded or injected.
-        var ACTIVITY = location.pathname.replace(/\/live\/?$/, "/activity");
-        var POLL_MS = 1000;
+        var BASE = location.pathname.replace(/\/live\/?$/, "");
+        var STREAM = BASE + "/activity/stream";
+        var ACTIVITY = BASE + "/activity";
+        // A call is often under ten milliseconds. The event arrives, but the eye
+        // needs longer than that, so a call stays on screen for at least this.
+        var MIN_SHOW = 900;
+        var USAGE_MS = 5000;
         var BUCKETS = 58;
 
         var body = document.body;
-        var dot = document.getElementById("dot");
         var stateEl = document.getElementById("state");
         var clock = document.getElementById("clock");
         var graph = document.getElementById("graph");
@@ -164,13 +167,20 @@
           graph.appendChild(bar);
           bars.push(bar);
         }
-        // One bucket per poll: how much of that second CatDesk was working.
+        // Calls finished in each second, not "was it busy when I looked".
+        // Sampling would show nothing for work this short.
         var history = new Array(BUCKETS).fill(0);
+        var bucket = 0;
 
         var running = null;
         var baseElapsed = 0;
         var baseAt = 0;
+        var holdUntil = 0;
+        var latest = null;
+        var lastCompleted = null;
+        var lastEventAt = Date.now();
         var lastRecentKey = "";
+        var firstRecent = true;
 
         function human(ms) {
           if (ms < 1000) return Math.round(ms) + "ms";
@@ -187,111 +197,173 @@
           return String(n);
         }
 
+        function esc(s) {
+          return String(s || "").replace(/[<>&]/g, function (c) {
+            return { "<": "&lt;", ">": "&gt;", "&": "&amp;" }[c];
+          });
+        }
+
         function paintGraph() {
           for (var i = 0; i < BUCKETS; i++) {
-            var v = history[i];
-            bars[i].style.height = (v > 0 ? 12 + v * 88 : 8) + "%";
-            bars[i].style.background = v > 0 ? "var(--busy)" : "#232a36";
+            var n = history[i];
+            bars[i].style.height = (n > 0 ? Math.min(100, 24 + n * 19) : 8) + "%";
+            bars[i].style.background = n > 0 ? "var(--busy)" : "#232a36";
           }
         }
         paintGraph();
+        window.setInterval(function () {
+          history.shift();
+          history.push(bucket);
+          bucket = 0;
+          paintGraph();
+        }, 1000);
 
         function renderRecent(list) {
           var key = list
-            .map(function (r) {
-              return r.tool + r.finishedMs;
-            })
+            .map(function (r) { return r.tool + r.finishedMs; })
             .join("|");
           if (key === lastRecentKey) return;
+          var isNew = !firstRecent;
           lastRecentKey = key;
+          firstRecent = false;
           recentEl.innerHTML = list
-            .map(function (r) {
-              var color = r.ok ? "var(--ok)" : "var(--bad)";
-              var detail = (r.detail || "").replace(/[<>&]/g, function (c) {
-                return { "<": "&lt;", ">": "&gt;", "&": "&amp;" }[c];
-              });
+            .map(function (r, index) {
               return (
-                '<div class="row"><span class="rdot" style="background:' +
-                color +
-                '"></span><span class="rtool">' +
-                r.tool +
-                '</span><span class="rdetail">' +
-                detail +
-                '</span><span class="rtime">' +
-                human(r.durationMs || 0) +
+                '<div class="row' + (isNew && index === 0 ? " fresh" : "") +
+                '"><span class="rdot" style="background:' +
+                (r.ok ? "var(--ok)" : "var(--bad)") +
+                '"></span><span class="rtool">' + esc(r.tool) +
+                '</span><span class="rdetail">' + esc(r.detail) +
+                '</span><span class="rtime">' + human(r.durationMs || 0) +
                 "</span></div>"
               );
             })
             .join("");
         }
 
+        function showRunning(head) {
+          running = head;
+          baseElapsed = head.elapsedMs || 0;
+          baseAt = Date.now();
+          body.setAttribute("data-busy", "1");
+          nowCard.classList.remove("empty");
+          toolEl.textContent = head.tool;
+          detailEl.textContent = head.detail || "";
+        }
+
+        function showIdle() {
+          running = null;
+          body.setAttribute("data-busy", "0");
+          nowCard.classList.add("empty");
+          toolEl.textContent = "—";
+          detailEl.textContent = "";
+        }
+
         function apply(data) {
           body.setAttribute("data-conn", "1");
+          latest = data;
+
+          if (lastCompleted !== null && data.completed > lastCompleted) {
+            bucket += data.completed - lastCompleted;
+          }
+          if (data.completed !== lastCompleted) lastEventAt = Date.now();
+          lastCompleted = data.completed;
+
           var list = data.running || [];
-
-          history.shift();
-          history.push(list.length ? 1 : 0);
-          paintGraph();
-
           if (list.length) {
-            var head = list[0];
-            running = head;
-            baseElapsed = head.elapsedMs || 0;
-            baseAt = Date.now();
-            body.setAttribute("data-busy", "1");
+            showRunning(list[0]);
             stateEl.textContent =
               list.length > 1 ? "运行中 (" + list.length + ")" : "运行中";
-            nowCard.classList.remove("empty");
-            toolEl.textContent = head.tool;
-            detailEl.textContent = head.detail || "";
-          } else if (running) {
-            running = null;
-            body.setAttribute("data-busy", "0");
-            stateEl.textContent = "空闲";
-            nowCard.classList.add("empty");
-            toolEl.textContent = "—";
-            detailEl.textContent = "";
-            clock.textContent = "—";
+            holdUntil = Date.now() + MIN_SHOW;
           }
-
           renderRecent(data.recent || []);
-
-          var usage = data.usage || {};
-          document.getElementById("s-calls").textContent =
-            usage.toolCallCount == null ? "—" : usage.toolCallCount.toLocaleString();
-          document.getElementById("s-tokens").textContent =
-            usage.totalTokens == null ? "—" : compact(usage.totalTokens);
-          document.getElementById("s-session").textContent =
-            data.completed == null ? "—" : data.completed;
         }
 
-        // Between polls the timer interpolates locally, so the number moves
-        // continuously instead of jumping once a second.
-        function tick() {
-          if (running) clock.textContent = human(baseElapsed + (Date.now() - baseAt));
-          window.requestAnimationFrame(tick);
+        // Between events the timer interpolates locally, and a finished call is
+        // held on screen until MIN_SHOW has passed so it is actually seen.
+        function frame() {
+          var now = Date.now();
+          if (running) {
+            clock.textContent = human(baseElapsed + (now - baseAt));
+            if (
+              latest && !(latest.running || []).length && now > holdUntil
+            ) {
+              showIdle();
+              stateEl.textContent = "空闲";
+            }
+          } else {
+            var since = now - lastEventAt;
+            clock.textContent = since < 1000 ? "刚刚" : Math.floor(since / 1000) + "s 前";
+          }
+          window.requestAnimationFrame(frame);
         }
-        window.requestAnimationFrame(tick);
+        window.requestAnimationFrame(frame);
 
-        function poll() {
+        function loadUsage() {
           fetch(ACTIVITY, {
             cache: "no-store",
             headers: { "ngrok-skip-browser-warning": "1" },
           })
-            .then(function (r) {
-              if (!r.ok) throw new Error(r.status);
-              return r.json();
+            .then(function (r) { return r.ok ? r.json() : null; })
+            .then(function (data) {
+              if (!data) return;
+              var usage = data.usage || {};
+              document.getElementById("s-calls").textContent =
+                usage.toolCallCount == null
+                  ? "—"
+                  : usage.toolCallCount.toLocaleString();
+              document.getElementById("s-tokens").textContent =
+                usage.totalTokens == null ? "—" : compact(usage.totalTokens);
+              document.getElementById("s-session").textContent =
+                data.completed == null ? "—" : data.completed;
             })
-            .then(apply)
-            .catch(function () {
-              body.setAttribute("data-conn", "0");
-              body.setAttribute("data-busy", "0");
-              stateEl.textContent = "离线";
-            });
+            .catch(function () {});
+        }
+        loadUsage();
+        window.setInterval(loadUsage, USAGE_MS);
+
+        var polling = null;
+        function startPolling() {
+          if (polling) return;
+          polling = window.setInterval(function () {
+            fetch(ACTIVITY, {
+              cache: "no-store",
+              headers: { "ngrok-skip-browser-warning": "1" },
+            })
+              .then(function (r) { return r.ok ? r.json() : null; })
+              .then(function (data) { if (data) apply(data); })
+              .catch(function () {
+                body.setAttribute("data-conn", "0");
+                stateEl.textContent = "离线";
+              });
+          }, 1000);
         }
 
-        poll();
-        window.setInterval(poll, POLL_MS);
+        // The stream is the point; polling is only a floor if it cannot open.
+        function connect() {
+          var source;
+          try {
+            source = new EventSource(STREAM);
+          } catch (error) {
+            startPolling();
+            return;
+          }
+          source.onmessage = function (event) {
+            if (polling) {
+              window.clearInterval(polling);
+              polling = null;
+            }
+            try {
+              apply(JSON.parse(event.data));
+            } catch (error) {}
+          };
+          source.onerror = function () {
+            body.setAttribute("data-conn", "0");
+            stateEl.textContent = "重连中";
+            startPolling();
+          };
+        }
+        connect();
       })();
     </script>
   </body>

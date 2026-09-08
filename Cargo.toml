@@ -16,7 +16,7 @@ crossterm = "0.28"
 # `rustls-tls` would also enable Ring and panic during TLS initialization.
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-webpki-roots-no-provider"] }
 rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
-tokio-stream = "0.1"
+tokio-stream = { version = "0.1", features = ["sync"] }
 base64 = "0.22"
 tiktoken-rs = "0.9.1"
 image = "0.25"

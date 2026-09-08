@@ -3,7 +3,7 @@ use axum::{
     body::{Body, Bytes},
     extract::{Form, Path, State},
     http::{HeaderMap, Response, StatusCode, header},
-    response::Json,
+    response::{Json, Sse, sse},
     routing::{delete, get, post},
 };
 use base64::Engine as _;
@@ -14,6 +14,8 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 use tokio::sync::{Mutex, mpsc::UnboundedSender};
+use tokio_stream::StreamExt as _;
+use tokio_stream::wrappers::BroadcastStream;
 
 use crate::command_jobs::CommandJobManager;
 use crate::devtools::DevtoolsBridge;
@@ -27,6 +29,9 @@ use crate::state::{
 const STATELESS_FLOW_ID: &str = "stateless";
 
 const LIVE_MONITOR_HTML: &str = include_str!("widget/live_monitor.html");
+/// Long enough that an idle connection is not mistaken for a dead one,
+/// short enough to survive a proxy's idle timeout.
+const ACTIVITY_KEEPALIVE_SECS: u64 = 15;
 
 #[derive(Clone)]
 struct ServerState {
@@ -70,6 +75,7 @@ pub fn router(
     let show_detail_mode = format!("{secret_prefix}/layout/show-detail");
     let activity_path = format!("{secret_prefix}/activity");
     let live_path = format!("{secret_prefix}/live");
+    let activity_stream_path = format!("{secret_prefix}/activity/stream");
 
     Router::new()
         .route(&health_path, get(health))
@@ -101,6 +107,7 @@ pub fn router(
         )
         .route(&activity_path, get(get_activity).options(options_activity))
         .route(&live_path, get(get_live_monitor))
+        .route(&activity_stream_path, get(get_activity_stream))
         .route(&mcp_path, post(post_mcp_http))
         .route(&mcp_path, get(get_mcp))
         .route(&mcp_path, delete(delete_mcp))
@@ -1197,6 +1204,28 @@ async fn get_activity(State(s): State<ServerState>) -> Response<Body> {
         .header(header::CONTENT_TYPE, "application/json")
         .body(Body::from(snapshot.to_string()))
         .unwrap()
+}
+
+/// Activity as it happens, rather than as it looks once a second.
+///
+/// A tool call is often under ten milliseconds, so a polling reader misses
+/// more than ninety-nine percent of them and reports an idle server through a
+/// working session. This emits on every begin and every finish instead.
+///
+/// The payload carries no usage totals: those change slowly and would mean
+/// taking the app lock on a hot path, so the page reads them separately.
+async fn get_activity_stream()
+-> Sse<impl tokio_stream::Stream<Item = Result<sse::Event, std::convert::Infallible>>> {
+    // The first event is the current state, so a page that connects between
+    // calls still renders something. After that every begin and every finish
+    // arrives as its own event, carrying the state as it was at that moment.
+    let initial = tokio_stream::once(crate::activity::snapshot().to_string());
+    let stream = initial
+        .chain(BroadcastStream::new(crate::activity::subscribe()).filter_map(Result::ok))
+        .map(|payload| Ok(sse::Event::default().data(payload)));
+    Sse::new(stream).keep_alive(
+        sse::KeepAlive::new().interval(std::time::Duration::from_secs(ACTIVITY_KEEPALIVE_SECS)),
+    )
 }
 
 /// The monitor page. It reads `/activity` next to itself, so the secret prefix

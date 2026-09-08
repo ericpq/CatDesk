@@ -14,6 +14,7 @@ use std::sync::{LazyLock, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{Value, json};
+use tokio::sync::broadcast;
 
 /// Long enough to identify the work, short enough to stay a single line.
 const MAX_DETAIL_CHARS: usize = 120;
@@ -22,6 +23,25 @@ const MAX_RECENT: usize = 5;
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 static ACTIVITY: LazyLock<Mutex<Activity>> = LazyLock::new(|| Mutex::new(Activity::default()));
+/// Deep enough to absorb a burst of fast calls before a slow reader lags.
+const EVENT_BUFFER: usize = 256;
+static EVENTS: LazyLock<broadcast::Sender<String>> =
+    LazyLock::new(|| broadcast::channel(EVENT_BUFFER).0);
+
+/// The state at each change, for a reader that cannot afford to sample.
+///
+/// Most calls finish in a few milliseconds, so a once-a-second poll sees
+/// almost none of them in flight. Each event also carries the snapshot taken
+/// when it was emitted: a coalescing channel, or re-reading the state on
+/// delivery, would show a call that had already finished by then.
+pub fn subscribe() -> broadcast::Receiver<String> {
+    EVENTS.subscribe()
+}
+
+fn notify() {
+    // No subscribers is the normal case; the error is not interesting.
+    let _ = EVENTS.send(snapshot().to_string());
+}
 
 #[derive(Clone, Debug)]
 struct InFlight {
@@ -103,6 +123,8 @@ impl Drop for Guard {
         activity.completed += 1;
         activity.recent.insert(0, finished);
         activity.recent.truncate(MAX_RECENT);
+        drop(activity);
+        notify();
     }
 }
 
@@ -116,6 +138,7 @@ pub fn begin(tool: &str, detail: Option<String>) -> Guard {
             started_ms: now_ms(),
         });
     }
+    notify();
     // Assume success: a handler that returns an error overwrites this, and a
     // dropped future never gets the chance to report either way.
     Guard { id, ok: true }
@@ -173,10 +196,16 @@ mod tests {
     #[test]
     fn activity_reports_running_work_and_then_its_result() {
         reset();
+        let mut events = subscribe();
 
         assert_eq!(snapshot()["busy"], json!(false));
 
         let mut guard = begin("run_checks", Some("cargo test --release".to_string()));
+        // A reader cannot poll for work this short, so it has to be told, and
+        // the event has to carry the running state rather than a promise to
+        // look it up later.
+        let started = events.try_recv().expect("no start event");
+        assert!(started.contains("\"busy\":true"), "start event: {started}");
         let running = snapshot();
         assert_eq!(running["busy"], json!(true));
         assert_eq!(running["running"][0]["tool"], json!("run_checks"));
@@ -187,6 +216,11 @@ mod tests {
 
         guard.set_ok(false);
         drop(guard);
+        let finished = events.try_recv().expect("no finish event");
+        assert!(
+            finished.contains("\"busy\":false"),
+            "finish event: {finished}"
+        );
 
         let done = snapshot();
         assert_eq!(done["busy"], json!(false));
