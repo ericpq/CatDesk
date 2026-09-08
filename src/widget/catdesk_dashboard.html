@@ -7954,5 +7954,165 @@
         }
       })();
     </script>
+    <script>
+      // Live activity strip.
+      //
+      // A tool call is one request and one response, so while a long run_checks
+      // is running the widget has nothing new to render and the panel looks
+      // hung. This polls CatDesk's own /activity endpoint directly from the
+      // page, the same way the agents and layout controls already call back, so
+      // showing progress costs no tokens and no tool calls.
+      //
+      // Deliberately self-contained: it owns its DOM, its styles and its timer,
+      // and touches nothing in the renderer above.
+      (function () {
+        var PAYLOAD_KEY = "catdesk/widgetPayload";
+        var POLL_MS = 1000;
+        var LINGER_MS = 2500;
+
+        function payload() {
+          try {
+            var meta = window.openai && window.openai.toolResponseMetadata;
+            var value = meta && meta[PAYLOAD_KEY];
+            return value && typeof value === "object" ? value : null;
+          } catch (error) {
+            return null;
+          }
+        }
+
+        var initial = payload();
+        var url = initial && initial.activityUrl;
+        if (!url) return;
+
+        var style = document.createElement("style");
+        style.textContent = [
+          ".cd-activity{position:fixed;left:0;right:0;bottom:0;z-index:2147483000;",
+          "display:flex;align-items:center;gap:10px;padding:8px 14px;",
+          "font:500 12px/1.4 ui-sans-serif,system-ui,-apple-system,'Segoe UI',sans-serif;",
+          "color:#e9edf5;background:rgba(17,20,28,.86);backdrop-filter:blur(10px);",
+          "border-top:1px solid rgba(255,255,255,.10);",
+          "transform:translateY(110%);transition:transform .28s cubic-bezier(.2,.7,.3,1);}",
+          ".cd-activity[data-show='1']{transform:translateY(0);}",
+          ".cd-activity-dot{flex:none;width:9px;height:9px;border-radius:50%;",
+          "background:#5b9dff;box-shadow:0 0 0 0 rgba(91,157,255,.65);",
+          "animation:cd-pulse 1.35s ease-out infinite;}",
+          ".cd-activity[data-state='done'] .cd-activity-dot{background:#3ddc97;animation:none;}",
+          ".cd-activity[data-state='failed'] .cd-activity-dot{background:#ff6b6b;animation:none;}",
+          "@keyframes cd-pulse{0%{box-shadow:0 0 0 0 rgba(91,157,255,.55)}",
+          "70%{box-shadow:0 0 0 8px rgba(91,157,255,0)}100%{box-shadow:0 0 0 0 rgba(91,157,255,0)}}",
+          ".cd-activity-tool{flex:none;font-weight:650;letter-spacing:.01em;}",
+          ".cd-activity-detail{flex:1 1 auto;min-width:0;overflow:hidden;",
+          "text-overflow:ellipsis;white-space:nowrap;opacity:.72;font-weight:400;}",
+          ".cd-activity-time{flex:none;font-variant-numeric:tabular-nums;opacity:.85;}",
+          ".cd-activity-track{position:absolute;left:0;right:0;top:-1px;height:1px;overflow:hidden;}",
+          ".cd-activity[data-state='running'] .cd-activity-track::after{content:'';position:absolute;",
+          "top:0;left:0;height:100%;width:34%;background:linear-gradient(90deg,",
+          "transparent,#5b9dff,transparent);animation:cd-sweep 1.5s linear infinite;}",
+          "@keyframes cd-sweep{from{transform:translateX(-120%)}to{transform:translateX(420%)}}",
+          "@media (prefers-color-scheme: light){.cd-activity{background:rgba(250,251,253,.92);",
+          "color:#1b2230;border-top-color:rgba(0,0,0,.08);}}",
+        ].join("");
+        document.head.appendChild(style);
+
+        var bar = document.createElement("div");
+        bar.className = "cd-activity";
+        bar.setAttribute("data-show", "0");
+        bar.setAttribute("data-state", "idle");
+        bar.innerHTML =
+          '<span class="cd-activity-track"></span>' +
+          '<span class="cd-activity-dot"></span>' +
+          '<span class="cd-activity-tool"></span>' +
+          '<span class="cd-activity-detail"></span>' +
+          '<span class="cd-activity-time"></span>';
+        document.body.appendChild(bar);
+
+        var toolEl = bar.querySelector(".cd-activity-tool");
+        var detailEl = bar.querySelector(".cd-activity-detail");
+        var timeEl = bar.querySelector(".cd-activity-time");
+
+        // Elapsed time ticks locally between polls, so the number moves every
+        // frame instead of once a second, and no clock skew can make it jump.
+        var current = null;
+        var baseElapsed = 0;
+        var baseAt = 0;
+        var hideAt = 0;
+
+        function human(ms) {
+          if (ms < 1000) return ms + "ms";
+          var seconds = ms / 1000;
+          if (seconds < 60) return seconds.toFixed(1) + "s";
+          var minutes = Math.floor(seconds / 60);
+          return minutes + "m" + String(Math.floor(seconds % 60)).padStart(2, "0") + "s";
+        }
+
+        function show(state, tool, detail) {
+          bar.setAttribute("data-state", state);
+          bar.setAttribute("data-show", "1");
+          toolEl.textContent = tool || "";
+          detailEl.textContent = detail || "";
+        }
+
+        function apply(data) {
+          var running = (data && data.running) || [];
+          if (running.length) {
+            var head = running[0];
+            var extra = running.length > 1 ? " +" + (running.length - 1) : "";
+            current = head;
+            baseElapsed = head.elapsedMs || 0;
+            baseAt = Date.now();
+            hideAt = 0;
+            show("running", head.tool + extra, head.detail);
+            return;
+          }
+          if (current) {
+            // Just finished: hold the result briefly so it is readable.
+            var last = (data && data.recent && data.recent[0]) || null;
+            current = null;
+            if (last) {
+              show(last.ok ? "done" : "failed", last.tool, last.detail);
+              timeEl.textContent = human(last.durationMs || 0);
+            }
+            hideAt = Date.now() + LINGER_MS;
+            return;
+          }
+          if (hideAt && Date.now() > hideAt) {
+            bar.setAttribute("data-show", "0");
+            hideAt = 0;
+          }
+        }
+
+        function tick() {
+          if (current) {
+            timeEl.textContent = human(baseElapsed + (Date.now() - baseAt));
+          } else if (hideAt && Date.now() > hideAt) {
+            bar.setAttribute("data-show", "0");
+            hideAt = 0;
+          }
+          window.requestAnimationFrame(tick);
+        }
+        window.requestAnimationFrame(tick);
+
+        function poll() {
+          fetch(url, {
+            method: "GET",
+            cache: "no-store",
+            headers: { "ngrok-skip-browser-warning": "1" },
+          })
+            .then(function (response) {
+              return response.ok ? response.json() : null;
+            })
+            .then(function (data) {
+              if (data) apply(data);
+            })
+            .catch(function () {
+              // A dropped poll is not worth reporting: the next one is a
+              // second away, and the strip keeps showing the last known state.
+            });
+        }
+
+        poll();
+        window.setInterval(poll, POLL_MS);
+      })();
+    </script>
   </body>
 </html>

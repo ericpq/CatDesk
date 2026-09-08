@@ -1,3 +1,4 @@
+mod activity;
 mod binagotchy_gen;
 mod browser;
 mod change_tracking;
@@ -6,6 +7,7 @@ mod checks;
 mod command;
 mod command_jobs;
 mod devtools;
+mod iyunzhi;
 #[cfg(target_os = "linux")]
 mod linux_sandbox;
 mod macos_terminal;

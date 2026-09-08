@@ -15,8 +15,8 @@ use crate::process_runner;
 
 pub const DEFAULT_JOB_TIMEOUT_MS: u64 = 30 * 60 * 1_000;
 pub const MAX_JOB_TIMEOUT_MS: u64 = 24 * 60 * 60 * 1_000;
-pub const MAX_POLL_WAIT_MS: u64 = 30_000;
-pub const DEFAULT_POLL_WAIT_MS: u64 = 10_000;
+pub const MAX_POLL_WAIT_MS: u64 = 10_000;
+pub const DEFAULT_POLL_WAIT_MS: u64 = 8_000;
 const MAX_ACTIVE_JOBS: usize = 8;
 const MAX_RETAINED_JOBS: usize = 64;
 const TERMINAL_JOB_TTL: StdDuration = StdDuration::from_secs(60 * 60);
@@ -71,6 +71,8 @@ pub struct CommandJobSnapshot {
     pub cwd: String,
     pub state: CommandJobState,
     pub elapsed_ms: u64,
+    pub idle_ms: u64,
+    pub last_output_elapsed_ms: Option<u64>,
     pub exit_code: Option<i32>,
     pub events: Vec<CommandOutputEvent>,
     pub next_cursor: u64,
@@ -94,6 +96,7 @@ struct JobRuntime {
     retained_output_bytes: usize,
     next_seq: u64,
     output_truncated: bool,
+    last_output_at: Option<Instant>,
 }
 
 impl Default for JobRuntime {
@@ -106,6 +109,7 @@ impl Default for JobRuntime {
             retained_output_bytes: 0,
             next_seq: 1,
             output_truncated: false,
+            last_output_at: None,
         }
     }
 }
@@ -162,6 +166,7 @@ impl CommandJob {
         let text = String::from_utf8_lossy(bytes).into_owned();
         let event_bytes = text.len();
         let mut runtime = self.runtime.lock().await;
+        runtime.last_output_at = Some(Instant::now());
         let seq = runtime.next_seq;
         runtime.next_seq = runtime.next_seq.saturating_add(1);
         runtime
@@ -196,6 +201,23 @@ impl CommandJob {
 
     async fn snapshot(&self, after: u64) -> CommandJobSnapshot {
         let runtime = self.runtime.lock().await;
+        let observed_at = runtime.finished_at.unwrap_or_else(Instant::now);
+        let elapsed_ms = observed_at
+            .saturating_duration_since(self.started_at)
+            .as_millis() as u64;
+        let last_output_elapsed_ms = runtime.last_output_at.map(|last_output_at| {
+            last_output_at
+                .saturating_duration_since(self.started_at)
+                .as_millis() as u64
+        });
+        let idle_ms = runtime
+            .last_output_at
+            .map(|last_output_at| {
+                observed_at
+                    .saturating_duration_since(last_output_at)
+                    .as_millis() as u64
+            })
+            .unwrap_or(elapsed_ms);
         let first_retained_seq = runtime
             .events
             .front()
@@ -225,7 +247,9 @@ impl CommandJob {
             command: self.command.clone(),
             cwd: self.cwd.to_string_lossy().into_owned(),
             state: runtime.state,
-            elapsed_ms: self.started_at.elapsed().as_millis() as u64,
+            elapsed_ms,
+            idle_ms,
+            last_output_elapsed_ms,
             exit_code: runtime.exit_code,
             events,
             next_cursor,
@@ -411,6 +435,26 @@ impl CommandJobManager {
             .as_ref()
             .map(ChangeSession::changes)
             .unwrap_or_default())
+    }
+
+    pub async fn retained_output(
+        &self,
+        job_id: &str,
+    ) -> Result<(CommandJobSnapshot, String, String), String> {
+        self.cleanup().await;
+        let job = self.get_job(job_id).await?;
+        let snapshot = job.snapshot(0).await;
+        let runtime = job.runtime.lock().await;
+        let mut stdout = String::new();
+        let mut stderr = String::new();
+        for event in &runtime.events {
+            match event.stream {
+                "stdout" => stdout.push_str(&event.text),
+                "stderr" => stderr.push_str(&event.text),
+                _ => {}
+            }
+        }
+        Ok((snapshot, stdout, stderr))
     }
 
     pub async fn cancel(&self, job_id: &str) -> Result<CommandJobSnapshot, String> {

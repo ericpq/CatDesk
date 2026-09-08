@@ -8,6 +8,7 @@ use std::sync::Arc;
 use tiktoken_rs::o200k_base_singleton;
 use tokio::sync::Mutex;
 
+use crate::activity;
 use crate::change_tracking::{ChangeScope, ChangeSession, ChangeTarget, FileChange};
 use crate::checkpoints;
 use crate::checks::{self, CheckKind};
@@ -17,6 +18,7 @@ use crate::command_jobs::{
     DEFAULT_POLL_WAIT_MS, MAX_JOB_TIMEOUT_MS, MAX_POLL_WAIT_MS,
 };
 use crate::devtools::DevtoolsBridge;
+use crate::iyunzhi;
 use crate::mascot;
 use crate::outline;
 use crate::state::{
@@ -39,7 +41,7 @@ const SERVER_VERSION: &str = "4.0.0";
 pub(crate) const MODERN_MCP_PROTOCOL_VERSION: &str = "2026-07-28";
 const SERVER_INFO_META_KEY: &str = "io.modelcontextprotocol/serverInfo";
 const UI_TEMPLATE_URI: &str = "ui://widget/catdesk-dashboard.html";
-const WIDGET_RESOURCE_REVISION: u32 = 3;
+const WIDGET_RESOURCE_REVISION: u32 = 4;
 const UI_TEMPLATE_MIME_TYPE: &str = "text/html;profile=mcp-app";
 pub(crate) const WIDGET_PAYLOAD_META_KEY: &str = "catdesk/widgetPayload";
 const CATDESK_WIDGET_HTML: &str = include_str!("widget/catdesk_dashboard.html");
@@ -620,12 +622,16 @@ fn local_tool_output_schema(name: &str) -> Option<Value> {
             for field in ["jobId", "command", "cwd", "state"] {
                 properties.insert(field.to_string(), json!({ "type": "string" }));
             }
-            for field in ["elapsedMs", "nextCursor", "timeoutMs"] {
+            for field in ["elapsedMs", "idleMs", "nextCursor", "timeoutMs"] {
                 properties.insert(
                     field.to_string(),
                     json!({ "type": "integer", "minimum": 0 }),
                 );
             }
+            properties.insert(
+                "lastOutputElapsedMs".to_string(),
+                json!({ "type": ["integer", "null"], "minimum": 0 }),
+            );
             properties.insert(
                 "exitCode".to_string(),
                 json!({ "type": ["integer", "null"] }),
@@ -715,10 +721,11 @@ fn local_tool_output_schema(name: &str) -> Option<Value> {
                 }),
             );
         }
-        "run_checks" => {
+        "run_checks" | "parse_checks" => {
             for field in ["kind", "command", "cwd", "outputTail"] {
                 properties.insert(field.to_string(), json!({ "type": "string" }));
             }
+            properties.insert("jobId".to_string(), json!({ "type": "string" }));
             properties.insert("summary".to_string(), json!({ "type": ["string", "null"] }));
             for field in ["passed", "failed"] {
                 properties.insert(
@@ -736,7 +743,12 @@ fn local_tool_output_schema(name: &str) -> Option<Value> {
                 "exitCode".to_string(),
                 json!({ "type": ["integer", "null"] }),
             );
-            for field in ["timedOut", "outputTailTruncated", "commandSuccess"] {
+            for field in [
+                "timedOut",
+                "outputTailTruncated",
+                "commandSuccess",
+                "outputTruncated",
+            ] {
                 properties.insert(field.to_string(), json!({ "type": "boolean" }));
             }
             properties.insert(
@@ -772,6 +784,26 @@ fn local_tool_output_schema(name: &str) -> Option<Value> {
                     }
                 }),
             );
+        }
+        "iyunzhi_bi_query" => {
+            for field in ["report", "path", "beginDate", "endDate", "cinema"] {
+                properties.insert(field.to_string(), json!({ "type": ["string", "null"] }));
+            }
+            for field in ["verifiedTemplate", "cinemaFilterApplied", "truncated"] {
+                properties.insert(field.to_string(), json!({ "type": ["boolean", "null"] }));
+            }
+            for field in ["rowsBeforeLocalFilters", "totalItems", "totalMatched"] {
+                properties.insert(
+                    field.to_string(),
+                    json!({ "type": ["integer", "null"], "minimum": 0 }),
+                );
+            }
+            properties.insert(
+                "rows".to_string(),
+                json!({ "type": "array", "items": { "type": "object" } }),
+            );
+            properties.insert("raw".to_string(), json!({}));
+            properties.insert("error".to_string(), json!({ "type": "string" }));
         }
         "outline" | "read_symbol" => {
             for field in ["path", "language"] {
@@ -968,7 +1000,7 @@ async fn handle_tools_list_with_show_detail_mode(
             tools.push(json!({
                 "name": "start_command",
                 "title": "Start command",
-                "description": "Start a long-running shell command inside the workspace and return a job ID immediately. Prefer this for builds, compilation, dependency installation, long test suites, and development servers instead of keeping run_command open.",
+                "description": "Start a long-running shell command inside the workspace and return a job ID immediately. Prefer this for builds, compilation, dependency installation, long test suites, and development servers. While a user is waiting, poll it regularly instead of leaving the conversation silent.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -992,7 +1024,7 @@ async fn handle_tools_list_with_show_detail_mode(
             tools.push(json!({
                 "name": "poll_command",
                 "title": "Poll command",
-                "description": "Read incremental output and current status from a command previously started with start_command. Pass the returned nextCursor as after on the next poll so output is not repeated. If hasMoreOutput is true, poll again even if the job is already terminal so the remaining buffered output can be drained.",
+                "description": "Read incremental output and current status from a command previously started with start_command. Every running response is a heartbeat and includes elapsed/idle timing even when there is no new stdout or stderr. Pass nextCursor as after so output is not repeated. While a user is waiting, poll at least every 10 seconds; if hasMoreOutput is true, keep polling even after the job becomes terminal.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -1027,7 +1059,7 @@ async fn handle_tools_list_with_show_detail_mode(
             tools.push(json!({
                 "name": "run_checks",
                 "title": "Run checks",
-                "description": "Run the project's tests, build or type check and return the verdict: pass/fail counts, the failing test names, and file/line diagnostics. Prefer this over running the test command through run_command, whose output is capped at 32 KiB from the start and therefore drops the summary at the end.",
+                "description": "Run a short project test, build or type check synchronously and return the verdict: pass/fail counts, failing test names, and file/line diagnostics. For checks that may take more than about 15 seconds, use start_command plus poll_command so the user receives heartbeats, then call parse_checks on the finished job.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -1039,7 +1071,43 @@ async fn handle_tools_list_with_show_detail_mode(
                 },
                 "annotations": { "readOnlyHint": false, "openWorldHint": true, "destructiveHint": false }
             }));
+            tools.push(json!({
+                "name": "parse_checks",
+                "title": "Parse check job",
+                "description": "Parse the retained output of a completed start_command job as a Cargo, pytest, Go, Node, or generic check and return the same structured verdict as run_checks. Use this after polling a long check to completion so progress remains visible while it runs.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "job_id": { "type": "string", "description": "Completed job ID returned by start_command" },
+                        "kind": { "type": "string", "enum": ["cargo", "pytest", "go", "node", "generic"], "description": "Toolchain to parse; detected from the job working directory when omitted" }
+                    },
+                    "required": ["job_id"]
+                },
+                "annotations": { "readOnlyHint": true, "openWorldHint": false, "destructiveHint": false }
+            }));
         }
+
+        tools.push(json!({
+            "name": "iyunzhi_bi_query",
+            "title": "Query YunZhi BI",
+            "description": "Query the YunZhi cinema BI service using credentials stored only in .catdesk/iyunzhi_session.json on the VPS. The tool never accepts or returns TOKEN/USER_ID/LEASE_CODE. Verified aliases: operating_statistic, category_group_sale, stock_trace, cinema_data. Other documented BI paths are allowed with a generic date/page payload and can be refined through extra. Automatically paginates, resolves cinemaLinkIds for stock_trace, and can filter returned rows locally.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "report": { "type": "string", "description": "Report alias or documented BI path. Verified aliases: operating_statistic, category_group_sale, stock_trace, cinema_data. Documented paths such as /bi/card/rechargeReport are also accepted." },
+                    "begin_date": { "type": "string", "description": "China-local start date YYYY-MM-DD. Required for POST BI reports; not needed for cinema_data." },
+                    "end_date": { "type": "string", "description": "China-local end date YYYY-MM-DD. Defaults to begin_date." },
+                    "cinema": { "type": "string", "description": "Cinema name substring. For stock_trace this is resolved to cinemaLinkIds before querying; for reports returning cinemaName it is applied as a local filter." },
+                    "page_size": { "type": "integer", "minimum": 1, "maximum": 500, "description": "BI page size (default 200)." },
+                    "max_rows": { "type": "integer", "minimum": 1, "maximum": 1000, "description": "Maximum rows returned to ChatGPT after pagination/filtering (default 200)." },
+                    "extra": { "type": "object", "description": "Extra/override JSON fields merged into the POST body for report-specific parameters.", "additionalProperties": true },
+                    "contains": { "type": "object", "description": "Local case-insensitive substring filters applied after fetching, keyed by response field name.", "additionalProperties": { "type": "string" } },
+                    "equals": { "type": "object", "description": "Local exact-value filters applied after fetching, keyed by response field name.", "additionalProperties": true }
+                },
+                "required": ["report"]
+            },
+            "annotations": { "readOnlyHint": true, "openWorldHint": true, "destructiveHint": false }
+        }));
 
         tools.push(catdesk_instruction_tool_descriptor());
         tools.push(json!({
@@ -1389,6 +1457,11 @@ async fn handle_tools_call_with_show_detail_mode(
         .unwrap_or("")
         .to_string();
 
+    // Held for the whole call: the widget polls this to show that work is
+    // still running. A guard rather than a pair of calls, so an early return
+    // cannot leave the strip claiming CatDesk is busy forever.
+    let mut activity_guard = activity::begin(&tool_name, activity_detail(req, &tool_name));
+
     if mode.computer_enabled() && tool_mode.write_tools_enabled() {
         capture_checkpoint_for_request(req, &tool_name, workspace_root);
     }
@@ -1414,7 +1487,12 @@ async fn handle_tools_call_with_show_detail_mode(
         } else if mode.computer_enabled() {
             if matches!(
                 tool_name.as_str(),
-                "run_command" | "start_command" | "poll_command" | "cancel_command" | "run_checks"
+                "run_command"
+                    | "start_command"
+                    | "poll_command"
+                    | "cancel_command"
+                    | "run_checks"
+                    | "parse_checks"
             ) {
                 if tool_mode.run_command_enabled() {
                     match tool_name.as_str() {
@@ -1434,6 +1512,7 @@ async fn handle_tools_call_with_show_detail_mode(
                         "poll_command" => handle_poll_command(req, command_jobs).await,
                         "cancel_command" => handle_cancel_command(req, command_jobs).await,
                         "run_checks" => handle_run_checks(req, workspace_root).await,
+                        "parse_checks" => handle_parse_checks(req, command_jobs).await,
                         _ => unreachable!(),
                     }
                 } else if tool_mode.read_only() {
@@ -1452,6 +1531,7 @@ async fn handle_tools_call_with_show_detail_mode(
                     "git_diff" => handle_git_diff(req, workspace_root).await,
                     "git_log" => handle_git_log(req, workspace_root).await,
                     "checkpoint_list" => handle_checkpoint_list(req, workspace_root),
+                    "iyunzhi_bi_query" => handle_iyunzhi_bi_query(req, workspace_root).await,
                     _ => {
                         if tool_mode.write_tools_enabled() {
                             match tool_name.as_str() {
@@ -1518,6 +1598,7 @@ async fn handle_tools_call_with_show_detail_mode(
         .and_then(|v| v.get("isError"))
         .and_then(Value::as_bool)
         .unwrap_or(false);
+    activity_guard.set_ok(!is_error);
     let has_turn_changes = !turn_files.is_empty();
     let widget_context = AutoWidgetContext {
         is_error,
@@ -1630,8 +1711,16 @@ where
 fn command_job_output_text(snapshot: &CommandJobSnapshot) -> String {
     if snapshot.events.is_empty() {
         return match snapshot.state {
-            CommandJobState::Running => "(no new output; command is still running)".to_string(),
-            _ => "(no new output)".to_string(),
+            CommandJobState::Running => format!(
+                "(heartbeat: command is still running; elapsed {:.1}s; no new output for {:.1}s)",
+                snapshot.elapsed_ms as f64 / 1_000.0,
+                snapshot.idle_ms as f64 / 1_000.0,
+            ),
+            _ => format!(
+                "(no new output; command is {}; elapsed {:.1}s)",
+                snapshot.state.as_str(),
+                snapshot.elapsed_ms as f64 / 1_000.0,
+            ),
         };
     }
     let mut output = format_command_output_events(
@@ -1670,6 +1759,8 @@ fn command_job_structured(tool_name: &str, snapshot: &CommandJobSnapshot) -> Val
         "cwd": snapshot.cwd,
         "state": snapshot.state.as_str(),
         "elapsedMs": snapshot.elapsed_ms,
+        "idleMs": snapshot.idle_ms,
+        "lastOutputElapsedMs": snapshot.last_output_elapsed_ms,
         "exitCode": snapshot.exit_code,
         "events": snapshot.events,
         "nextCursor": snapshot.next_cursor,
@@ -2441,6 +2532,39 @@ fn handle_read_symbol(req: &JsonRpcRequest, workspace_root: &str) -> JsonRpcResp
     )
 }
 
+/// A one-line hint of what a call is working on, so the status strip can say
+/// "run_checks - cargo test" instead of just naming the tool.
+fn activity_detail(req: &JsonRpcRequest, tool_name: &str) -> Option<String> {
+    let arguments = tool_arguments(req);
+    let key = match tool_name {
+        "run_command" | "start_command" | "run_checks" => "command",
+        "write" | "edit" | "delete" | "outline" | "read_symbol" => "path",
+        "search" => "pattern",
+        "find_symbol" => "name",
+        "git_status" | "git_diff" | "git_log" | "git_add" | "git_commit" | "apply_patch" => "cwd",
+        "read" => "paths",
+        _ => return None,
+    };
+    if key == "paths" {
+        return arguments
+            .get("paths")
+            .and_then(Value::as_array)
+            .map(|paths| {
+                paths
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+            .filter(|detail| !detail.is_empty());
+    }
+    arguments
+        .get(key)
+        .and_then(Value::as_str)
+        .filter(|detail| !detail.is_empty())
+        .map(str::to_string)
+}
+
 fn handle_checkpoint_list(req: &JsonRpcRequest, workspace_root: &str) -> JsonRpcResponse {
     let recorded = checkpoints::list(Path::new(workspace_root));
     let items: Vec<Value> = recorded
@@ -2523,6 +2647,97 @@ fn handle_checkpoint_restore(req: &JsonRpcRequest, workspace_root: &str) -> Json
             )
         }
         Err(error) => tool_error_response(req, error),
+    }
+}
+
+async fn handle_iyunzhi_bi_query(req: &JsonRpcRequest, workspace_root: &str) -> JsonRpcResponse {
+    let arguments = tool_arguments(req);
+    let report = match required_string_argument(&arguments, "report") {
+        Ok(value) => value.to_string(),
+        Err(error) => return tool_error_response(req, error),
+    };
+    let begin_date = match optional_string_argument(&arguments, "begin_date") {
+        Ok(value) => value.map(str::to_string),
+        Err(error) => return tool_error_response(req, error),
+    };
+    let end_date = match optional_string_argument(&arguments, "end_date") {
+        Ok(value) => value.map(str::to_string),
+        Err(error) => return tool_error_response(req, error),
+    };
+    let cinema = match optional_string_argument(&arguments, "cinema") {
+        Ok(value) => value.map(str::to_string),
+        Err(error) => return tool_error_response(req, error),
+    };
+    let page_size = match optional_usize_argument(&arguments, "page_size") {
+        Ok(value) => value,
+        Err(error) => return tool_error_response(req, error),
+    };
+    let max_rows = match optional_usize_argument(&arguments, "max_rows") {
+        Ok(value) => value,
+        Err(error) => return tool_error_response(req, error),
+    };
+
+    let extra = match arguments.get("extra") {
+        Some(Value::Object(value)) => value.clone(),
+        Some(_) => return tool_error_response(req, "Parameter extra must be an object".into()),
+        None => Map::new(),
+    };
+    let contains = match arguments.get("contains") {
+        Some(Value::Object(value)) => {
+            let mut filters = std::collections::BTreeMap::new();
+            for (field, needle) in value {
+                let Some(needle) = needle.as_str() else {
+                    return tool_error_response(
+                        req,
+                        format!("Parameter contains.{field} must be a string"),
+                    );
+                };
+                filters.insert(field.clone(), needle.to_string());
+            }
+            filters
+        }
+        Some(_) => return tool_error_response(req, "Parameter contains must be an object".into()),
+        None => std::collections::BTreeMap::new(),
+    };
+    let equals = match arguments.get("equals") {
+        Some(Value::Object(value)) => value
+            .iter()
+            .map(|(field, expected)| (field.clone(), expected.clone()))
+            .collect::<std::collections::BTreeMap<_, _>>(),
+        Some(_) => return tool_error_response(req, "Parameter equals must be an object".into()),
+        None => std::collections::BTreeMap::new(),
+    };
+
+    let query = iyunzhi::Query {
+        report,
+        begin_date,
+        end_date,
+        cinema,
+        page_size,
+        max_rows,
+        extra,
+        contains,
+        equals,
+    };
+
+    match iyunzhi::query(Path::new(workspace_root), query).await {
+        Ok(mut structured) => {
+            if let Some(obj) = structured.as_object_mut() {
+                obj.insert("toolName".to_string(), json!("iyunzhi_bi_query"));
+            }
+            let text = serde_json::to_string_pretty(&structured)
+                .unwrap_or_else(|_| "YunZhi BI query succeeded".to_string());
+            tool_success_response_with_structured(req, text, structured)
+        }
+        Err(error) => tool_error_response_with_structured(
+            req,
+            error.clone(),
+            json!({
+                "toolName": "iyunzhi_bi_query",
+                "success": false,
+                "error": error,
+            }),
+        ),
     }
 }
 
@@ -2659,6 +2874,128 @@ async fn handle_run_checks(req: &JsonRpcRequest, workspace_root: &str) -> JsonRp
     // shell saying the command does not exist, and a timeout means the run
     // never finished. A red test run is a successful call with a red verdict.
     let produced_a_verdict = result.exit_code != Some(127) && !result.timed_out;
+    if produced_a_verdict {
+        tool_success_response_with_structured(req, text, structured)
+    } else {
+        tool_error_response_with_structured(req, text, structured)
+    }
+}
+
+async fn handle_parse_checks(
+    req: &JsonRpcRequest,
+    command_jobs: &CommandJobManager,
+) -> JsonRpcResponse {
+    let arguments = tool_arguments(req);
+    let job_id = match required_string_argument(&arguments, "job_id") {
+        Ok(value) => value,
+        Err(error) => return tool_error_response(req, error),
+    };
+    let (snapshot, stdout, stderr) = match command_jobs.retained_output(job_id).await {
+        Ok(value) => value,
+        Err(error) => return tool_error_response(req, error),
+    };
+    if snapshot.state == CommandJobState::Running {
+        return tool_error_response(
+            req,
+            format!(
+                "command job {job_id} is still running after {:.1}s; keep polling it before parse_checks",
+                snapshot.elapsed_ms as f64 / 1_000.0
+            ),
+        );
+    }
+
+    let kind = match optional_string_argument(&arguments, "kind") {
+        Ok(Some(value)) => match CheckKind::parse(value) {
+            Some(kind) => kind,
+            None => {
+                return tool_error_response(
+                    req,
+                    format!("Unknown check kind: {value}. Use cargo, pytest, go, node or generic."),
+                );
+            }
+        },
+        Ok(None) => CheckKind::detect(Path::new(&snapshot.cwd)),
+        Err(error) => return tool_error_response(req, error),
+    };
+
+    let outcome = checks::parse(kind, &stdout, &stderr);
+    let mut transcript = stdout;
+    if !stderr.is_empty() {
+        if !transcript.is_empty() {
+            transcript.push('\n');
+        }
+        transcript.push_str(&stderr);
+    }
+    let (tail, tail_truncated) = checks::output_tail(&transcript);
+    let failures: Vec<Value> = outcome
+        .failures
+        .iter()
+        .map(|failure| {
+            json!({
+                "name": failure.name,
+                "file": failure.file,
+                "line": failure.line,
+                "message": failure.message,
+            })
+        })
+        .collect();
+    let diagnostics: Vec<Value> = outcome
+        .diagnostics
+        .iter()
+        .map(|diagnostic| {
+            json!({
+                "severity": diagnostic.severity,
+                "file": diagnostic.file,
+                "line": diagnostic.line,
+                "column": diagnostic.column,
+                "message": diagnostic.message,
+            })
+        })
+        .collect();
+
+    let command_success = snapshot.state == CommandJobState::Succeeded;
+    let timed_out = snapshot.state == CommandJobState::TimedOut;
+    let verdict = command_success && outcome.failed.unwrap_or(0) == 0;
+    let text = format!(
+        "{} ({}) {} - job {} in {} ms{}",
+        snapshot.command,
+        kind.as_str(),
+        if verdict { "PASSED" } else { "FAILED" },
+        snapshot.state.as_str(),
+        snapshot.elapsed_ms,
+        if snapshot.output_truncated {
+            " (retained output was truncated)"
+        } else {
+            ""
+        }
+    );
+    let structured = json!({
+        "toolName": "parse_checks",
+        "jobId": snapshot.job_id,
+        "kind": kind.as_str(),
+        "command": snapshot.command,
+        "cwd": snapshot.cwd,
+        "exitCode": snapshot.exit_code,
+        "success": verdict,
+        "commandSuccess": command_success,
+        "timedOut": timed_out,
+        "durationMs": snapshot.elapsed_ms,
+        "passed": outcome.passed,
+        "failed": outcome.failed,
+        "failures": failures,
+        "diagnostics": diagnostics,
+        "summary": outcome.summary,
+        "outputTail": tail,
+        "outputTailTruncated": tail_truncated,
+        "outputTruncated": snapshot.output_truncated,
+        "outputBytes": transcript.len(),
+    });
+
+    let produced_a_verdict = snapshot.exit_code != Some(127)
+        && !matches!(
+            snapshot.state,
+            CommandJobState::Cancelled | CommandJobState::TimedOut
+        );
     if produced_a_verdict {
         tool_success_response_with_structured(req, text, structured)
     } else {
@@ -3357,7 +3694,7 @@ Always specify the branch explicitly when using `git push`."#
                     .to_string(),
             );
             lines.push(
-                "Use run_checks to run tests, builds and type checks. It returns pass/fail counts, the failing test names and file/line diagnostics, so a failure can be acted on directly instead of read out of a transcript."
+                "Use run_checks for short tests, builds and type checks. For anything likely to take more than about 15 seconds, use start_command, poll_command at least every 10 seconds while the user is waiting, and parse_checks after completion. A running poll is a heartbeat even when there is no new stdout/stderr, so do not leave the user wondering whether the task is stuck."
                     .to_string(),
             );
             lines.push(
@@ -3654,6 +3991,7 @@ fn tool_descriptor_should_attach_widget(name: &str) -> bool {
             | "find_symbol"
             | "read_symbol"
             | "run_checks"
+            | "parse_checks"
             | "checkpoint_list"
             | "checkpoint_restore"
             | "run_command"
@@ -5520,6 +5858,8 @@ mod tests {
                 "poll_command",
                 "cancel_command",
                 "run_checks",
+                "parse_checks",
+                "iyunzhi_bi_query",
                 "catdesk_instruction",
                 "read",
                 "search",
@@ -5889,6 +6229,7 @@ mod tests {
         assert_eq!(
             names,
             vec![
+                "iyunzhi_bi_query",
                 "catdesk_instruction",
                 "read",
                 "search",
@@ -8044,7 +8385,10 @@ hello world"
     #[test]
     fn widget_resource_uri_includes_revision_for_cache_busting() {
         let uri = current_widget_resource_uri_for_tool("catdesk_instruction");
-        assert!(uri.contains("widgetRevision=3"));
+        // Track the constant rather than a literal: ChatGPT caches the widget
+        // by URI, so the revision has to move whenever the dashboard changes,
+        // and a test that pins the old number just makes that look like a bug.
+        assert!(uri.contains(&format!("widgetRevision={WIDGET_RESOURCE_REVISION}")));
         assert!(uri.contains("toolName=catdesk_instruction"));
     }
 

@@ -66,6 +66,7 @@ pub fn router(
     let agents_path_state = format!("{secret_prefix}/agents/path-state");
     let token_stats_layout = format!("{secret_prefix}/layout/token-stats");
     let show_detail_mode = format!("{secret_prefix}/layout/show-detail");
+    let activity_path = format!("{secret_prefix}/activity");
 
     Router::new()
         .route(&health_path, get(health))
@@ -95,6 +96,7 @@ pub fn router(
             &show_detail_mode,
             post(post_show_detail_mode).options(options_show_detail_mode),
         )
+        .route(&activity_path, get(get_activity).options(options_activity))
         .route(&mcp_path, post(post_mcp_http))
         .route(&mcp_path, get(get_mcp))
         .route(&mcp_path, delete(delete_mcp))
@@ -833,6 +835,15 @@ fn attach_catdesk_instruction_actions(
         json!(binagotchy_action_base_url.clone().unwrap_or_default()),
     );
     widget_payload.insert(
+        "activityUrl".to_string(),
+        json!(
+            public_action_base_url
+                .as_deref()
+                .map(|base| format!("{base}/activity"))
+                .unwrap_or_default()
+        ),
+    );
+    widget_payload.insert(
         "agentsPathModeUrl".to_string(),
         json!(
             public_action_base_url
@@ -1150,6 +1161,23 @@ async fn get_agents_path_state(State(s): State<ServerState>) -> Response<Body> {
         app.workspace_root.clone()
     };
     agents_state_response(&workspace_root)
+}
+
+/// What CatDesk is doing right now. Polled by the widget on a timer, so it is
+/// deliberately cheap: no workspace access, no locks held across an await.
+async fn get_activity(State(_s): State<ServerState>) -> Response<Body> {
+    with_widget_action_cors(Response::builder())
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(crate::activity::snapshot().to_string()))
+        .unwrap()
+}
+
+async fn options_activity(State(_s): State<ServerState>) -> Response<Body> {
+    with_widget_action_cors(Response::builder())
+        .status(StatusCode::NO_CONTENT)
+        .body(Body::empty())
+        .unwrap()
 }
 
 async fn options_agents_path_state(State(_s): State<ServerState>) -> Response<Body> {
@@ -1692,7 +1720,7 @@ mod tests {
         }
         let (success, widgets) = tracked.expect("missing bootstrap tools/list event");
         assert!(success);
-        assert_eq!(widgets.len(), 22);
+        assert_eq!(widgets.len(), 23);
         assert_eq!(
             widgets
                 .iter()
@@ -1704,6 +1732,7 @@ mod tests {
                 "poll_command",
                 "cancel_command",
                 "run_checks",
+                "parse_checks",
                 "catdesk_instruction",
                 "read",
                 "search",
