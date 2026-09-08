@@ -26,6 +26,8 @@ use crate::state::{
 
 const STATELESS_FLOW_ID: &str = "stateless";
 
+const LIVE_MONITOR_HTML: &str = include_str!("widget/live_monitor.html");
+
 #[derive(Clone)]
 struct ServerState {
     app: SharedState,
@@ -67,6 +69,7 @@ pub fn router(
     let token_stats_layout = format!("{secret_prefix}/layout/token-stats");
     let show_detail_mode = format!("{secret_prefix}/layout/show-detail");
     let activity_path = format!("{secret_prefix}/activity");
+    let live_path = format!("{secret_prefix}/live");
 
     Router::new()
         .route(&health_path, get(health))
@@ -97,6 +100,7 @@ pub fn router(
             post(post_show_detail_mode).options(options_show_detail_mode),
         )
         .route(&activity_path, get(get_activity).options(options_activity))
+        .route(&live_path, get(get_live_monitor))
         .route(&mcp_path, post(post_mcp_http))
         .route(&mcp_path, get(get_mcp))
         .route(&mcp_path, delete(delete_mcp))
@@ -1165,11 +1169,44 @@ async fn get_agents_path_state(State(s): State<ServerState>) -> Response<Body> {
 
 /// What CatDesk is doing right now. Polled by the widget on a timer, so it is
 /// deliberately cheap: no workspace access, no locks held across an await.
-async fn get_activity(State(_s): State<ServerState>) -> Response<Body> {
+async fn get_activity(State(s): State<ServerState>) -> Response<Body> {
+    let mut snapshot = crate::activity::snapshot();
+    {
+        let app = s.app.lock().await;
+        let mut usage = crate::state::UsageTotals::default();
+        for totals in app.usage_by_model.values() {
+            usage.tool_input_tokens += totals.tool_input_tokens;
+            usage.tool_output_tokens += totals.tool_output_tokens;
+            usage.total_tokens += totals.total_tokens;
+            usage.tool_call_count += totals.tool_call_count;
+        }
+        if let Some(object) = snapshot.as_object_mut() {
+            object.insert(
+                "usage".to_string(),
+                json!({
+                    "toolInputTokens": usage.tool_input_tokens,
+                    "toolOutputTokens": usage.tool_output_tokens,
+                    "totalTokens": usage.total_tokens,
+                    "toolCallCount": usage.tool_call_count,
+                }),
+            );
+        }
+    }
     with_widget_action_cors(Response::builder())
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "application/json")
-        .body(Body::from(crate::activity::snapshot().to_string()))
+        .body(Body::from(snapshot.to_string()))
+        .unwrap()
+}
+
+/// The monitor page. It reads `/activity` next to itself, so the secret prefix
+/// never has to be hardcoded into the page or injected on the way out.
+async fn get_live_monitor(State(_s): State<ServerState>) -> Response<Body> {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
+        .header(header::CACHE_CONTROL, "no-store")
+        .body(Body::from(LIVE_MONITOR_HTML))
         .unwrap()
 }
 

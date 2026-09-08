@@ -1,0 +1,298 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="dark" />
+    <title>CatDesk Monitor</title>
+    <style>
+      :root {
+        --bg: #0e1117;
+        --panel: #141922;
+        --line: rgba(255, 255, 255, 0.07);
+        --hair: rgba(255, 255, 255, 0.04);
+        --fg: #e9edf5;
+        --dim: #8b93a3;
+        --faint: #6b7484;
+        --idle: #3a4250;
+        --busy: #5b9dff;
+        --ok: #3ddc97;
+        --bad: #ff6b6b;
+        --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      }
+      * { box-sizing: border-box; }
+      html, body { height: 100%; }
+      body {
+        margin: 0;
+        background: var(--bg);
+        color: var(--fg);
+        font: 400 13px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI",
+          "Microsoft YaHei", sans-serif;
+        -webkit-font-smoothing: antialiased;
+      }
+      #app { padding: 16px 18px 14px; max-width: 720px; margin: 0 auto; }
+      .head {
+        display: flex;
+        align-items: flex-end;
+        justify-content: space-between;
+        margin-bottom: 14px;
+      }
+      .state { display: flex; align-items: center; gap: 9px; }
+      #dot {
+        width: 10px; height: 10px; border-radius: 50%;
+        background: var(--idle); flex: none;
+        transition: background 0.25s ease;
+      }
+      body[data-busy="1"] #dot {
+        background: var(--busy);
+        animation: pulse 1.35s ease-out infinite;
+      }
+      body[data-conn="0"] #dot { background: var(--bad); animation: none; }
+      @keyframes pulse {
+        0% { box-shadow: 0 0 0 0 rgba(91, 157, 255, 0.55); }
+        70% { box-shadow: 0 0 0 8px rgba(91, 157, 255, 0); }
+        100% { box-shadow: 0 0 0 0 rgba(91, 157, 255, 0); }
+      }
+      #state { font-size: 14px; font-weight: 500; }
+      #clock {
+        font: 500 30px/1 var(--mono);
+        font-variant-numeric: tabular-nums;
+        letter-spacing: -0.02em;
+      }
+      #graph {
+        display: flex; align-items: flex-end; gap: 2px;
+        height: 48px; padding-bottom: 2px;
+        border-bottom: 1px solid var(--line); margin-bottom: 14px;
+      }
+      #graph span {
+        flex: 1; border-radius: 1px 1px 0 0; background: #232a36; height: 8%;
+        transition: height 0.3s ease, background 0.3s ease;
+      }
+      .card {
+        background: var(--panel); border-radius: 8px;
+        padding: 11px 13px; margin-bottom: 12px;
+      }
+      .card.empty { opacity: 0.45; }
+      .cap {
+        font-size: 11px; letter-spacing: 0.06em; color: var(--faint);
+      }
+      .now { display: flex; align-items: center; gap: 8px; margin-bottom: 5px; }
+      #tool { font-weight: 500; font-size: 13px; }
+      #detail {
+        font: 400 12px/1.4 var(--mono); color: var(--dim);
+        overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+      }
+      #recent { margin-top: 7px; }
+      .row {
+        display: flex; align-items: center; gap: 9px;
+        padding: 5px 0; border-bottom: 1px solid var(--hair);
+      }
+      .rdot { width: 6px; height: 6px; border-radius: 50%; flex: none; }
+      .rtool { flex: none; font-size: 12px; font-weight: 500; }
+      .rdetail {
+        flex: 1 1 auto; min-width: 0; overflow: hidden;
+        text-overflow: ellipsis; white-space: nowrap;
+        font: 400 11px var(--mono); color: var(--faint);
+      }
+      .rtime {
+        flex: none; font: 400 11px var(--mono); color: var(--dim);
+        font-variant-numeric: tabular-nums;
+      }
+      .stats {
+        display: flex; gap: 22px; flex-wrap: wrap;
+        margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--line);
+      }
+      .stat div:first-child {
+        font-size: 11px; color: var(--faint); margin-bottom: 2px;
+      }
+      .stat div:last-child {
+        font: 500 15px var(--mono); font-variant-numeric: tabular-nums;
+      }
+      #err {
+        display: none; margin-top: 10px; font-size: 12px; color: var(--bad);
+      }
+      body[data-conn="0"] #err { display: block; }
+    </style>
+  </head>
+  <body data-busy="0" data-conn="1">
+    <div id="app">
+      <div class="head">
+        <div class="state"><span id="dot"></span><span id="state">空闲</span></div>
+        <div id="clock">—</div>
+      </div>
+
+      <div id="graph"></div>
+
+      <div class="card empty" id="nowcard">
+        <div class="now"><span class="cap">当前</span><span id="tool">—</span></div>
+        <div id="detail"></div>
+      </div>
+
+      <div class="cap">最近</div>
+      <div id="recent"></div>
+
+      <div class="stats">
+        <div class="stat"><div>工具调用</div><div id="s-calls">—</div></div>
+        <div class="stat"><div>累计 token</div><div id="s-tokens">—</div></div>
+        <div class="stat"><div>本次会话</div><div id="s-session">—</div></div>
+      </div>
+
+      <div id="err">连接断开，正在重试…</div>
+    </div>
+
+    <script>
+      (function () {
+        // The page is served next to the endpoint it reads, so it never needs
+        // the secret prefix hardcoded or injected.
+        var ACTIVITY = location.pathname.replace(/\/live\/?$/, "/activity");
+        var POLL_MS = 1000;
+        var BUCKETS = 58;
+
+        var body = document.body;
+        var dot = document.getElementById("dot");
+        var stateEl = document.getElementById("state");
+        var clock = document.getElementById("clock");
+        var graph = document.getElementById("graph");
+        var nowCard = document.getElementById("nowcard");
+        var toolEl = document.getElementById("tool");
+        var detailEl = document.getElementById("detail");
+        var recentEl = document.getElementById("recent");
+
+        var bars = [];
+        for (var i = 0; i < BUCKETS; i++) {
+          var bar = document.createElement("span");
+          graph.appendChild(bar);
+          bars.push(bar);
+        }
+        // One bucket per poll: how much of that second CatDesk was working.
+        var history = new Array(BUCKETS).fill(0);
+
+        var running = null;
+        var baseElapsed = 0;
+        var baseAt = 0;
+        var lastRecentKey = "";
+
+        function human(ms) {
+          if (ms < 1000) return Math.round(ms) + "ms";
+          var s = ms / 1000;
+          if (s < 60) return s.toFixed(1) + "s";
+          var m = Math.floor(s / 60);
+          return m + "m" + String(Math.floor(s % 60)).padStart(2, "0") + "s";
+        }
+
+        function compact(n) {
+          if (n >= 1e9) return (n / 1e9).toFixed(1) + "B";
+          if (n >= 1e6) return (n / 1e6).toFixed(1) + "M";
+          if (n >= 1e3) return (n / 1e3).toFixed(1) + "K";
+          return String(n);
+        }
+
+        function paintGraph() {
+          for (var i = 0; i < BUCKETS; i++) {
+            var v = history[i];
+            bars[i].style.height = (v > 0 ? 12 + v * 88 : 8) + "%";
+            bars[i].style.background = v > 0 ? "var(--busy)" : "#232a36";
+          }
+        }
+        paintGraph();
+
+        function renderRecent(list) {
+          var key = list
+            .map(function (r) {
+              return r.tool + r.finishedMs;
+            })
+            .join("|");
+          if (key === lastRecentKey) return;
+          lastRecentKey = key;
+          recentEl.innerHTML = list
+            .map(function (r) {
+              var color = r.ok ? "var(--ok)" : "var(--bad)";
+              var detail = (r.detail || "").replace(/[<>&]/g, function (c) {
+                return { "<": "&lt;", ">": "&gt;", "&": "&amp;" }[c];
+              });
+              return (
+                '<div class="row"><span class="rdot" style="background:' +
+                color +
+                '"></span><span class="rtool">' +
+                r.tool +
+                '</span><span class="rdetail">' +
+                detail +
+                '</span><span class="rtime">' +
+                human(r.durationMs || 0) +
+                "</span></div>"
+              );
+            })
+            .join("");
+        }
+
+        function apply(data) {
+          body.setAttribute("data-conn", "1");
+          var list = data.running || [];
+
+          history.shift();
+          history.push(list.length ? 1 : 0);
+          paintGraph();
+
+          if (list.length) {
+            var head = list[0];
+            running = head;
+            baseElapsed = head.elapsedMs || 0;
+            baseAt = Date.now();
+            body.setAttribute("data-busy", "1");
+            stateEl.textContent =
+              list.length > 1 ? "运行中 (" + list.length + ")" : "运行中";
+            nowCard.classList.remove("empty");
+            toolEl.textContent = head.tool;
+            detailEl.textContent = head.detail || "";
+          } else if (running) {
+            running = null;
+            body.setAttribute("data-busy", "0");
+            stateEl.textContent = "空闲";
+            nowCard.classList.add("empty");
+            toolEl.textContent = "—";
+            detailEl.textContent = "";
+            clock.textContent = "—";
+          }
+
+          renderRecent(data.recent || []);
+
+          var usage = data.usage || {};
+          document.getElementById("s-calls").textContent =
+            usage.toolCallCount == null ? "—" : usage.toolCallCount.toLocaleString();
+          document.getElementById("s-tokens").textContent =
+            usage.totalTokens == null ? "—" : compact(usage.totalTokens);
+          document.getElementById("s-session").textContent =
+            data.completed == null ? "—" : data.completed;
+        }
+
+        // Between polls the timer interpolates locally, so the number moves
+        // continuously instead of jumping once a second.
+        function tick() {
+          if (running) clock.textContent = human(baseElapsed + (Date.now() - baseAt));
+          window.requestAnimationFrame(tick);
+        }
+        window.requestAnimationFrame(tick);
+
+        function poll() {
+          fetch(ACTIVITY, {
+            cache: "no-store",
+            headers: { "ngrok-skip-browser-warning": "1" },
+          })
+            .then(function (r) {
+              if (!r.ok) throw new Error(r.status);
+              return r.json();
+            })
+            .then(apply)
+            .catch(function () {
+              body.setAttribute("data-conn", "0");
+              body.setAttribute("data-busy", "0");
+              stateEl.textContent = "离线";
+            });
+        }
+
+        poll();
+        window.setInterval(poll, POLL_MS);
+      })();
+    </script>
+  </body>
+</html>
