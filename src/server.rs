@@ -1177,7 +1177,7 @@ async fn get_agents_path_state(State(s): State<ServerState>) -> Response<Body> {
 /// What CatDesk is doing right now. Polled by the widget on a timer, so it is
 /// deliberately cheap: no workspace access, no locks held across an await.
 async fn get_activity(State(s): State<ServerState>) -> Response<Body> {
-    let mut snapshot = crate::activity::snapshot();
+    let mut snapshot = crate::activity::full_snapshot();
     {
         let app = s.app.lock().await;
         let mut usage = crate::state::UsageTotals::default();

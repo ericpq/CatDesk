@@ -1598,7 +1598,7 @@ async fn handle_tools_call_with_show_detail_mode(
         .and_then(|v| v.get("isError"))
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    activity_guard.set_ok(!is_error);
+    activity_guard.set_result(!is_error, activity_failure_reason(&response, is_error));
     let has_turn_changes = !turn_files.is_empty();
     let widget_context = AutoWidgetContext {
         is_error,
@@ -2563,6 +2563,23 @@ fn activity_detail(req: &JsonRpcRequest, tool_name: &str) -> Option<String> {
         .and_then(Value::as_str)
         .filter(|detail| !detail.is_empty())
         .map(str::to_string)
+}
+
+/// The message a failed call came back with, so a red row in the monitor says
+/// why rather than only that.
+fn activity_failure_reason(response: &JsonRpcResponse, is_error: bool) -> Option<String> {
+    if !is_error {
+        return None;
+    }
+    let structured = response.result.as_ref()?.get("structuredContent")?;
+    for key in ["message", "stderr", "summary"] {
+        if let Some(text) = structured.get(key).and_then(Value::as_str)
+            && !text.trim().is_empty()
+        {
+            return Some(text.to_string());
+        }
+    }
+    None
 }
 
 fn handle_checkpoint_list(req: &JsonRpcRequest, workspace_root: &str) -> JsonRpcResponse {
