@@ -22,9 +22,10 @@ use tokio::sync::broadcast;
 const MAX_DETAIL_CHARS: usize = 120;
 /// Why a call failed, trimmed to something that fits a row.
 const MAX_REASON_CHARS: usize = 160;
-/// Recent calls kept in full. Five was enough to prove the endpoint worked and
-/// far too few to watch a session with.
-const MAX_RECENT: usize = 40;
+/// Recent calls kept in full. The monitor shows the newest few; the rest are
+/// here so a glance back is possible without making the list a wall of rows.
+/// The per-tool totals, not this list, are what summarise a session.
+const MAX_RECENT: usize = 12;
 /// Timestamps kept for the activity graph. At one call a second this is about
 /// ten minutes, which is the span worth looking at on a monitor.
 const MAX_HISTORY: usize = 600;
