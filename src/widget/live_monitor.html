@@ -178,6 +178,27 @@
         flex: none; width: 104px; text-align: right; font: 400 11px var(--mono);
         color: var(--dim); font-variant-numeric: tabular-nums;
       }
+
+      /* A desktop widget window is narrow. Keep the same information, drop
+         the padding and let the tiles wrap to two columns. */
+      @media (max-width: 520px) {
+        .bar { padding: 11px 14px; }
+        .wrap { padding: 14px 14px 0; }
+        .hero { padding: 14px 14px 10px; }
+        .hero-top { gap: 10px; margin-bottom: 10px; }
+        #clock { font-size: 24px; }
+        body[data-busy="0"] #clock { font-size: 13px; }
+        #headline { font-size: 14px; }
+        #graph { height: 38px; }
+        .tiles { grid-template-columns: repeat(2, 1fr); gap: 7px; }
+        .tile { padding: 9px 11px; }
+        .tile b { font-size: 16px; }
+        .row { padding: 8px 12px; gap: 8px; }
+        .rtool { font-size: 12px; }
+        .trow { padding: 7px 12px; gap: 9px; }
+        .tname { width: 92px; font-size: 12px; }
+        .tnum { width: 86px; }
+      }
     </style>
   </head>
   <body data-busy="0" data-conn="1">

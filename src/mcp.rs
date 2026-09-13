@@ -62,6 +62,19 @@ const CATDESK_INSTRUCTION_REQUIRED_MESSAGE: &str =
 const CATDESK_INSTRUCTION_REQUIRED_WIDGET_MESSAGE: &str = "ChatGPT didn’t call catdesk_instruction. CatDesk is asking it to call it now. You can ignore this message. It will retry automatically.";
 const CATDESK_INSTRUCTION_REQUIRED_CODE: &str = "CATDESK_INSTRUCTION_REQUIRED";
 
+fn root_command_enabled() -> bool {
+    #[cfg(unix)]
+    {
+        std::env::var("CATDESK_ENABLE_ROOT_COMMAND").is_ok_and(|value| value == "1")
+            && unsafe { libc::geteuid() == 0 }
+    }
+
+    #[cfg(not(unix))]
+    {
+        false
+    }
+}
+
 // ── JSON-RPC types ──────────────────────────────────────────
 
 #[derive(Deserialize)]
@@ -659,7 +672,7 @@ fn local_tool_output_schema(name: &str) -> Option<Value> {
                 }),
             );
         }
-        "run_command" => {
+        "run_command" | "root_command" => {
             for field in [
                 "command",
                 "cwd",
@@ -997,6 +1010,28 @@ async fn handle_tools_list_with_show_detail_mode(
                 },
                 "annotations": { "readOnlyHint": false, "openWorldHint": true, "destructiveHint": true }
             }));
+            if root_command_enabled() {
+                tools.push(json!({
+                    "name": "root_command",
+                    "title": "Run root command",
+                    "description": "Execute a short shell command as root across the host filesystem, outside the normal workspace Landlock sandbox. This tool is exposed only when CatDesk itself runs as root and CATDESK_ENABLE_ROOT_COMMAND=1 is explicitly set. Use it only for host-level administration that cannot be completed with a narrower dedicated tool.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "command": { "type": "string", "description": "The root shell command to execute" },
+                            "cwd": { "type": "string", "description": "Absolute host working directory (default: /)" },
+                            "timeout": {
+                                "type": "integer",
+                                "minimum": 1,
+                                "maximum": command::MAX_TIMEOUT_MS,
+                                "description": format!("Timeout in milliseconds. Maximum {}.", command::MAX_TIMEOUT_MS)
+                            }
+                        },
+                        "required": ["command"]
+                    },
+                    "annotations": { "readOnlyHint": false, "openWorldHint": true, "destructiveHint": true }
+                }));
+            }
             tools.push(json!({
                 "name": "start_command",
                 "title": "Start command",
@@ -1488,6 +1523,7 @@ async fn handle_tools_call_with_show_detail_mode(
             if matches!(
                 tool_name.as_str(),
                 "run_command"
+                    | "root_command"
                     | "start_command"
                     | "poll_command"
                     | "cancel_command"
@@ -1498,6 +1534,13 @@ async fn handle_tools_call_with_show_detail_mode(
                     match tool_name.as_str() {
                         "run_command" => {
                             handle_run_command(req, workspace_root, set_catdesk_as_co_author).await
+                        }
+                        "root_command" => {
+                            if root_command_enabled() {
+                                handle_root_command(req).await
+                            } else {
+                                tool_error_response(req, "Unknown tool: root_command".into())
+                            }
                         }
                         "start_command" => {
                             handle_start_command(
@@ -3050,6 +3093,73 @@ fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
+async fn handle_root_command(req: &JsonRpcRequest) -> JsonRpcResponse {
+    let arguments = req
+        .params
+        .get("arguments")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    let Some(cmd) = arguments.get("command").and_then(Value::as_str) else {
+        return tool_error_response(req, "Missing required parameter: command".into());
+    };
+    if let Some(reason) = command::blocked_destructive_command(cmd) {
+        return tool_error_response(req, reason.into());
+    }
+
+    let timeout_ms = arguments.get("timeout").and_then(Value::as_u64);
+    if let Some(timeout_ms) = timeout_ms {
+        if timeout_ms == 0 {
+            return tool_error_response(req, "timeout must be at least 1 ms".into());
+        }
+        if timeout_ms > command::MAX_TIMEOUT_MS {
+            return tool_error_response(
+                req,
+                format!(
+                    "root_command supports at most {} ms",
+                    command::MAX_TIMEOUT_MS
+                ),
+            );
+        }
+    }
+
+    let cwd = arguments
+        .get("cwd")
+        .and_then(Value::as_str)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/"));
+    if !cwd.is_absolute() {
+        return tool_error_response(req, "root_command cwd must be an absolute path".into());
+    }
+
+    let result = command::run_command(
+        cmd,
+        Path::new("/"),
+        &cwd,
+        command::clamp_timeout(timeout_ms),
+    )
+    .await;
+    let output = command::format_result(&result);
+    let structured = json!({
+        "toolName": "root_command",
+        "command": cmd,
+        "cwd": cwd.to_string_lossy().to_string(),
+        "stdout": result.stdout,
+        "stderr": result.stderr,
+        "success": result.success,
+        "exitCode": result.exit_code,
+        "elapsedMs": result.elapsed_ms,
+        "timedOut": result.timed_out,
+        "stdoutTruncated": result.stdout_truncated,
+        "stderrTruncated": result.stderr_truncated,
+    });
+
+    if result.success {
+        tool_success_response_with_structured(req, output, structured)
+    } else {
+        tool_error_response_with_structured(req, output, structured)
+    }
+}
+
 async fn handle_run_command(
     req: &JsonRpcRequest,
     workspace_root: &str,
@@ -3729,6 +3839,12 @@ Always specify the branch explicitly when using `git push`."#
     }
 
     if mode.computer_enabled() && tool_mode.run_command_enabled() {
+        if root_command_enabled() {
+            lines.push(
+                "root_command is an explicit host-level exception to the workspace boundary: it runs as root across the host filesystem. Prefer narrower dedicated tools when they can do the job, and use root_command only for host administration that requires access outside the workspace."
+                    .to_string(),
+            );
+        }
         lines.push(
             "Use run_command only as a last resort when the available dedicated tools cannot complete the operation, and keep it for short commands that should finish quickly."
                 .to_string(),
@@ -4803,6 +4919,7 @@ fn is_local_destructive_tool(tool_name: &str) -> bool {
         "run_checks"
             | "checkpoint_restore"
             | "run_command"
+            | "root_command"
             | "start_command"
             | "poll_command"
             | "cancel_command"
@@ -5845,6 +5962,16 @@ mod tests {
         );
         assert!(result_text(&response).contains("Use start_command"));
         let _ = std::fs::remove_dir_all(workspace_root);
+    }
+
+    #[tokio::test]
+    async fn root_command_rejects_relative_cwd() {
+        let req = tool_call_request(
+            "root_command",
+            json!({ "command": "pwd", "cwd": "relative/path" }),
+        );
+        let response = handle_root_command(&req).await;
+        assert!(result_text(&response).contains("cwd must be an absolute path"));
     }
 
     #[tokio::test]

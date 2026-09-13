@@ -58,6 +58,7 @@ const REMOTE_CONNECT_UI_GRACE_MS: u128 = 8_000;
 const UI_POLL_INTERVAL: Duration = Duration::from_nanos(1_000_000_000 / 60);
 const MCP_URL_REVEAL_DURATION: Duration = Duration::from_secs(10);
 const MCP_URL_MASK: &str = "https://▓▓▓▓▓▓▓▓/▓▓▓▓▓▓▓▓/mcp";
+const MONITOR_URL_MASK: &str = "https://▓▓▓▓▓▓▓▓/▓▓▓▓▓▓▓▓/live";
 const MCP_PATH_MASK: &str = "/▓▓▓▓▓▓▓▓/mcp";
 const NGROK_URL_MASK: &str = "https://▓▓▓▓▓▓▓▓";
 const NGROK_DOMAIN_MASK: &str = "▓▓▓▓▓▓▓▓";
@@ -4022,9 +4023,15 @@ async fn start_services(
         app.log("INFO", format!("MCP Server started on port {port}"));
     }
 
-    // Start ngrok
-    if let Err(e) = ngrok::start(state.clone()).await {
-        state.lock().await.log("ERROR", format!("ngrok: {e}"));
+    // Oracle-KR is published directly through the local nginx reverse proxy.
+    // Keep the public base URL available to CatDesk, but do not start ngrok.
+    {
+        let mut app = state.lock().await;
+        app.ngrok_url = Some("https://kr.172363.xyz".into());
+        app.log(
+            "INFO",
+            "Direct public endpoint enabled: https://kr.172363.xyz".into(),
+        );
     }
 
     devtools_bridge
@@ -4290,6 +4297,7 @@ async fn run_tui(
                                         } else if let Some(ref url) = last_mcp_url {
                                             let prefix = &url[..url.len().min(30)];
                                             if line.contains("MCP Server URL")
+                                                || line.contains("Monitor")
                                                 || line.contains(prefix)
                                             {
                                                 let revealed = mcp_url_revealed_until
@@ -4299,7 +4307,12 @@ async fn run_tui(
                                                     })
                                                     .is_some();
                                                 if revealed {
-                                                    Some(url.clone())
+                                                    if line.contains("Monitor") {
+                                                        url.strip_suffix("/mcp")
+                                                            .map(|base| format!("{base}/live"))
+                                                    } else {
+                                                        Some(url.clone())
+                                                    }
                                                 } else {
                                                     let now = Instant::now();
                                                     mcp_url_revealed_until =
@@ -4451,6 +4464,14 @@ fn draw_ui(
     let mcp_url = match (&full_mcp_url, mcp_url_is_revealed) {
         (Some(url), true) => url.clone(),
         (Some(_), false) => MCP_URL_MASK.to_string(),
+        (None, _) => "--".to_string(),
+    };
+    let full_monitor_url = full_mcp_url
+        .as_deref()
+        .and_then(|url| url.strip_suffix("/mcp").map(|base| format!("{base}/live")));
+    let monitor_url = match (&full_monitor_url, mcp_url_is_revealed) {
+        (Some(url), true) => url.clone(),
+        (Some(_), false) => MONITOR_URL_MASK.to_string(),
         (None, _) => "--".to_string(),
     };
     let mcp_url_security_status = mcp_url_reveal_remaining
@@ -4624,6 +4645,21 @@ fn draw_ui(
             }
             Line::from(spans)
         },
+        Line::from(vec![
+            status_label("Monitor"),
+            Span::styled(
+                &monitor_url,
+                Style::default().fg(if has_url {
+                    if mcp_url_is_revealed {
+                        palette.info_fg
+                    } else {
+                        palette.muted_fg
+                    }
+                } else {
+                    palette.muted_fg
+                }),
+            ),
+        ]),
         Line::from(vec![
             status_label("Workspace"),
             Span::styled(

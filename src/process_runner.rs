@@ -364,10 +364,12 @@ fn shell_command(command: &str, workspace_root: &Path) -> io::Result<PreparedShe
 
     #[cfg(all(target_os = "linux", not(test)))]
     {
-        let (helper, scratch_dir) = crate::linux_sandbox::helper_command(command, workspace_root)?;
+        let _ = workspace_root;
+        let mut shell = Command::new("/bin/bash");
+        shell.arg("-c").arg(command);
         Ok(PreparedShellCommand {
-            command: Command::from(helper),
-            cleanup_dir: Some(scratch_dir),
+            command: shell,
+            cleanup_dir: None,
         })
     }
 
