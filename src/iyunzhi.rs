@@ -280,51 +280,75 @@ fn build_payload(
     Ok(Some(Value::Object(obj)))
 }
 
+fn retryable_http_status(status: u16) -> bool {
+    matches!(status, 429 | 502 | 503 | 504)
+}
+
 async fn send_request(
     client: &Client,
     session: &Session,
     spec: ReportSpec,
     payload: Option<Value>,
 ) -> Result<Value, String> {
-    let mut url = Url::parse(&format!("{BASE_URL}{}", spec.path))
-        .map_err(|_| "Invalid configured BI endpoint".to_string())?;
-    url.query_pairs_mut()
-        .append_pair("access_token", &session.token);
+    for attempt in 0..=1 {
+        let mut url = Url::parse(&format!("{BASE_URL}{}", spec.path))
+            .map_err(|_| "Invalid configured BI endpoint".to_string())?;
+        url.query_pairs_mut()
+            .append_pair("access_token", &session.token);
 
-    let mut request = client
-        .request(spec.method.reqwest(), url)
-        .header("content-type", "application/json;charset=UTF-8")
-        .header("gray-lease-code", &session.lease_code)
-        .header("gray-user-id", &session.user_id)
-        .header("origin", "https://lark.yuekeyun.com")
-        .header("referer", "https://lark.yuekeyun.com/")
-        .header("user-agent", "Mozilla/5.0");
-    if let Some(payload) = payload {
-        request = request.json(&payload);
+        let mut request = client
+            .request(spec.method.reqwest(), url)
+            .header("content-type", "application/json;charset=UTF-8")
+            .header("gray-lease-code", &session.lease_code)
+            .header("gray-user-id", &session.user_id)
+            .header("origin", "https://lark.yuekeyun.com")
+            .header("referer", "https://lark.yuekeyun.com/")
+            .header("user-agent", "Mozilla/5.0");
+        if let Some(payload) = payload.as_ref() {
+            request = request.json(payload);
+        }
+
+        let response = match request.send().await {
+            Ok(response) => response,
+            Err(_) if attempt == 0 => {
+                tokio::time::sleep(Duration::from_millis(150)).await;
+                continue;
+            }
+            Err(_) => {
+                return Err("YunZhi BI request failed before a response was received".to_string());
+            }
+        };
+        let status = response.status();
+        let text = match response.text().await {
+            Ok(text) => text,
+            Err(_) if attempt == 0 => {
+                tokio::time::sleep(Duration::from_millis(150)).await;
+                continue;
+            }
+            Err(_) => return Err("Failed to read the YunZhi BI response body".to_string()),
+        };
+
+        if !status.is_success() {
+            if attempt == 0 && retryable_http_status(status.as_u16()) {
+                tokio::time::sleep(Duration::from_millis(150)).await;
+                continue;
+            }
+            return Err(format!(
+                "YunZhi BI returned HTTP {}: {}",
+                status.as_u16(),
+                safe_body_excerpt(&text)
+            ));
+        }
+
+        return serde_json::from_str(&text).map_err(|_| {
+            format!(
+                "YunZhi BI returned a non-JSON response: {}",
+                safe_body_excerpt(&text)
+            )
+        });
     }
 
-    let response = request
-        .send()
-        .await
-        .map_err(|_| "YunZhi BI request failed before a response was received".to_string())?;
-    let status = response.status();
-    let text = response
-        .text()
-        .await
-        .map_err(|_| "Failed to read the YunZhi BI response body".to_string())?;
-    if !status.is_success() {
-        return Err(format!(
-            "YunZhi BI returned HTTP {}: {}",
-            status.as_u16(),
-            safe_body_excerpt(&text)
-        ));
-    }
-    serde_json::from_str(&text).map_err(|_| {
-        format!(
-            "YunZhi BI returned a non-JSON response: {}",
-            safe_body_excerpt(&text)
-        )
-    })
+    Err("YunZhi BI retry exhausted".to_string())
 }
 
 async fn resolve_cinema_link_ids(
@@ -595,6 +619,16 @@ mod tests {
             china_midnight_as_utc("2026-01-01").unwrap(),
             "2025-12-31T16:00:00.000Z"
         );
+    }
+
+    #[test]
+    fn transient_http_retry_is_limited_to_safe_gateway_failures() {
+        for status in [429, 502, 503, 504] {
+            assert!(retryable_http_status(status));
+        }
+        for status in [400, 401, 403, 404, 409, 500] {
+            assert!(!retryable_http_status(status));
+        }
     }
 
     #[test]

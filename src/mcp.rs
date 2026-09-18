@@ -9,6 +9,7 @@ use tiktoken_rs::o200k_base_singleton;
 use tokio::sync::Mutex;
 
 use crate::activity;
+use crate::agent_runtime::{self, AgentUpdate, PlanUpdate};
 use crate::change_tracking::{ChangeScope, ChangeSession, ChangeTarget, FileChange};
 use crate::checkpoints;
 use crate::checks::{self, CheckKind};
@@ -25,6 +26,7 @@ use crate::state::{
     AgentsPathMode, Mode, ShowDetailMode, TokenStatsLayout, ToolMode, app_config_path,
     load_app_config, user_home_dir,
 };
+use crate::tool_registry;
 use crate::workspace_tools;
 
 /// A test run is routinely slower than a shell command, so `run_checks`
@@ -882,6 +884,31 @@ fn local_tool_output_schema(name: &str) -> Option<Value> {
                 }),
             );
         }
+        "agent_status" => {
+            properties.insert("state".to_string(), json!({ "type": "object" }));
+            properties.insert(
+                "recentAudit".to_string(),
+                json!({ "type": "array", "items": { "type": "object" } }),
+            );
+            properties.insert("activity".to_string(), json!({ "type": "object" }));
+            properties.insert("health".to_string(), json!({ "type": "object" }));
+            properties.insert("policy".to_string(), json!({ "type": "object" }));
+        }
+        "agent_checkpoint" | "agent_plan" => {
+            properties.insert("state".to_string(), json!({ "type": "object" }));
+        }
+        "agent_recover" => {
+            properties.insert("state".to_string(), json!({ "type": "object" }));
+            properties.insert("action".to_string(), json!({ "type": "string" }));
+            properties.insert("recommendation".to_string(), json!({ "type": "string" }));
+            properties.insert("checkpointId".to_string(), json!({ "type": "string" }));
+            for field in ["restored", "removed", "skipped"] {
+                properties.insert(
+                    field.to_string(),
+                    json!({ "type": "array", "items": { "type": "string" } }),
+                );
+            }
+        }
         "checkpoint_list" => {
             properties.insert(
                 "count".to_string(),
@@ -1279,6 +1306,14 @@ async fn handle_tools_list_with_show_detail_mode(
         }));
 
         tools.push(json!({
+            "name": "agent_status",
+            "title": "Agent status",
+            "description": "Read CatDesk's persistent task checkpoint, recent tool audit metadata, and live activity snapshot. Use this before resuming a long task after reconnects or context compaction.",
+            "inputSchema": { "type": "object", "properties": {} },
+            "annotations": { "readOnlyHint": true, "openWorldHint": false, "destructiveHint": false }
+        }));
+
+        tools.push(json!({
             "name": "checkpoint_list",
             "title": "List checkpoints",
             "description": "List the pre-images CatDesk recorded before recent write, edit, delete and apply_patch calls, newest first. Shell commands are not checkpointed.",
@@ -1287,6 +1322,50 @@ async fn handle_tools_list_with_show_detail_mode(
         }));
 
         if tool_mode.write_tools_enabled() {
+            tools.push(json!({
+                "name": "agent_checkpoint",
+                "title": "Update agent checkpoint",
+                "description": "Persist a compact task checkpoint across reconnects and context compaction. Update only fields that changed; omitted fields are preserved. Use after a major milestone, before risky service work, or when blocked.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "goal": { "type": "string", "maxLength": 2000 },
+                        "status": { "type": "string", "enum": ["queued", "active", "waiting", "verifying", "blocked", "done", "failed"] },
+                        "phase": { "type": "string", "maxLength": 400 },
+                        "next_step": { "type": "string", "maxLength": 2000 },
+                        "note": { "type": "string", "maxLength": 600 },
+                        "clear_notes": { "type": "boolean", "description": "Clear prior bounded notes before optionally appending note." }
+                    }
+                },
+                "annotations": { "readOnlyHint": false, "openWorldHint": false, "destructiveHint": false }
+            }));
+            tools.push(json!({
+                "name": "agent_plan",
+                "title": "Manage agent plan",
+                "description": "Persist a bounded plan for non-trivial tasks. Replace the plan with up to 12 concise steps or update one step status. Use only when decomposition materially helps.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "steps": { "type": "array", "maxItems": 12, "items": { "type": "string", "maxLength": 240 } },
+                        "step_index": { "type": "integer", "minimum": 0 },
+                        "step_status": { "type": "string", "enum": ["pending", "active", "verifying", "blocked", "done", "failed"] },
+                        "clear": { "type": "boolean" }
+                    }
+                },
+                "annotations": { "readOnlyHint": false, "openWorldHint": false, "destructiveHint": false }
+            }));
+            tools.push(json!({
+                "name": "agent_recover",
+                "title": "Recover agent",
+                "description": "Run one bounded safe recovery step. auto chooses rollback_latest for unverified workspace mutations or resume for a blocked/waiting task when health permits. inspect is read-only in effect. The same recovery action cannot repeat and total recovery attempts are capped at two.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "action": { "type": "string", "enum": ["auto", "inspect", "rollback_latest", "resume"], "description": "Recovery action; defaults to auto." }
+                    }
+                },
+                "annotations": { "readOnlyHint": false, "openWorldHint": false, "destructiveHint": true }
+            }));
             tools.push(json!({
                 "name": "git_add",
                 "title": "Git add",
@@ -1442,7 +1521,9 @@ async fn handle_tools_list_with_show_detail_mode(
     for tool in &mut tools {
         ensure_local_tool_output_schema(tool);
         ensure_tool_descriptor_widget_template_with_show_detail_mode(tool, show_detail_mode);
+        tool_registry::attach_policy_meta(tool);
     }
+    tools.retain(|tool| tool_registry::descriptor_allowed(tool, tool_mode.read_only()));
 
     JsonRpcResponse::success(req.id.clone(), json!({ "tools": tools }))
 }
@@ -1491,6 +1572,7 @@ async fn handle_tools_call_with_show_detail_mode(
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
+    let audit_started = std::time::Instant::now();
 
     // Held for the whole call: the widget polls this to show that work is
     // still running. A guard rather than a pair of calls, so an early return
@@ -1518,6 +1600,17 @@ async fn handle_tools_call_with_show_detail_mode(
                 tool_mode,
                 show_detail_mode,
             )
+        } else if tool_registry::local_policy(&tool_name)
+            .is_some_and(|policy| !tool_registry::allows(policy.access, tool_mode.read_only()))
+        {
+            let required = tool_registry::local_policy(&tool_name)
+                .map(|policy| policy.access)
+                .unwrap_or(tool_registry::AccessLevel::Admin);
+            if tool_mode.read_only() {
+                read_only_blocked_response(req, &tool_name)
+            } else {
+                access_blocked_response(req, &tool_name, required)
+            }
         // Local computer tools
         } else if mode.computer_enabled() {
             if matches!(
@@ -1570,6 +1663,7 @@ async fn handle_tools_call_with_show_detail_mode(
                     "outline" => handle_outline(req, workspace_root),
                     "find_symbol" => handle_find_symbol(req, workspace_root),
                     "read_symbol" => handle_read_symbol(req, workspace_root),
+                    "agent_status" => handle_agent_status(req, workspace_root, tool_mode),
                     "git_status" => handle_git_status(req, workspace_root).await,
                     "git_diff" => handle_git_diff(req, workspace_root).await,
                     "git_log" => handle_git_log(req, workspace_root).await,
@@ -1578,6 +1672,9 @@ async fn handle_tools_call_with_show_detail_mode(
                     _ => {
                         if tool_mode.write_tools_enabled() {
                             match tool_name.as_str() {
+                                "agent_checkpoint" => handle_agent_checkpoint(req, workspace_root),
+                                "agent_plan" => handle_agent_plan(req, workspace_root),
+                                "agent_recover" => handle_agent_recover(req, workspace_root),
                                 "git_add" => handle_git_add(req, workspace_root).await,
                                 "git_commit" => {
                                     handle_git_commit(req, workspace_root, set_catdesk_as_co_author)
@@ -1592,8 +1689,14 @@ async fn handle_tools_call_with_show_detail_mode(
                                 }
                                 _ => {
                                     if mode.browser_enabled() {
-                                        forward_to_devtools(req, &tool_name, tool_mode, devtools)
-                                            .await
+                                        forward_to_devtools(
+                                            req,
+                                            &tool_name,
+                                            tool_mode,
+                                            devtools,
+                                            workspace_root,
+                                        )
+                                        .await
                                     } else {
                                         tool_error_response(
                                             req,
@@ -1605,7 +1708,14 @@ async fn handle_tools_call_with_show_detail_mode(
                         } else if tool_mode.read_only() && is_local_destructive_tool(&tool_name) {
                             read_only_blocked_response(req, &tool_name)
                         } else if mode.browser_enabled() {
-                            forward_to_devtools(req, &tool_name, tool_mode, devtools).await
+                            forward_to_devtools(
+                                req,
+                                &tool_name,
+                                tool_mode,
+                                devtools,
+                                workspace_root,
+                            )
+                            .await
                         } else {
                             tool_error_response(req, format!("Unknown tool: {tool_name}"))
                         }
@@ -1613,7 +1723,7 @@ async fn handle_tools_call_with_show_detail_mode(
                 }
             }
         } else if mode.browser_enabled() {
-            forward_to_devtools(req, &tool_name, tool_mode, devtools).await
+            forward_to_devtools(req, &tool_name, tool_mode, devtools, workspace_root).await
         } else {
             tool_error_response(req, format!("Unknown tool: {tool_name}"))
         }
@@ -1642,6 +1752,20 @@ async fn handle_tools_call_with_show_detail_mode(
         .and_then(Value::as_bool)
         .unwrap_or(false);
     activity_guard.set_result(!is_error, activity_failure_reason(&response, is_error));
+    if let Some(policy) = tool_registry::local_policy(&tool_name) {
+        let _ = agent_runtime::note_tool_outcome(
+            Path::new(workspace_root),
+            &tool_name,
+            policy.verify,
+            !is_error,
+        );
+    }
+    let _ = agent_runtime::record_tool_call(
+        Path::new(workspace_root),
+        &tool_name,
+        !is_error,
+        audit_started.elapsed().as_millis().min(u64::MAX as u128) as u64,
+    );
     let has_turn_changes = !turn_files.is_empty();
     let widget_context = AutoWidgetContext {
         is_error,
@@ -1683,27 +1807,42 @@ async fn forward_to_devtools(
     tool_name: &str,
     tool_mode: ToolMode,
     devtools: &Option<Arc<Mutex<DevtoolsBridge>>>,
+    workspace_root: &str,
 ) -> JsonRpcResponse {
     let params = &req.params;
     let Some(bridge) = devtools else {
         return tool_error_response(req, format!("Unknown tool: {tool_name}"));
     };
 
-    if tool_mode.read_only() {
-        match devtools_tool_is_read_only(bridge, tool_name).await {
-            Some(true) => {}
-            Some(false) => return read_only_blocked_response(req, tool_name),
-            None => {
-                return tool_error_response(
-                    req,
-                    format!(
-                        "Tool '{tool_name}' is blocked in read-only mode (cannot verify readOnlyHint)"
-                    ),
-                );
-            }
+    let descriptor = devtools_tool_descriptor(bridge, tool_name).await;
+    let access = descriptor
+        .as_ref()
+        .map(tool_registry::descriptor_access)
+        .unwrap_or(tool_registry::AccessLevel::Admin);
+    if !tool_registry::allows(access, tool_mode.read_only()) {
+        if tool_mode.read_only() {
+            return read_only_blocked_response(req, tool_name);
         }
+        return access_blocked_response(req, tool_name, access);
+    }
+    if descriptor.is_none()
+        && tool_registry::configured_max_access() != tool_registry::AccessLevel::Admin
+    {
+        return tool_error_response(
+            req,
+            format!(
+                "Tool '{tool_name}' is blocked because CatDesk cannot verify its access annotations"
+            ),
+        );
     }
 
+    let retry_once = descriptor
+        .as_ref()
+        .is_some_and(|tool| tool_registry::descriptor_retry(tool) == "transient_once");
+    let verify_policy = descriptor
+        .as_ref()
+        .map(tool_registry::descriptor_verify)
+        .unwrap_or("observable_state");
     let forward_req = json!({
         "jsonrpc": "2.0",
         "id": req.id,
@@ -1711,27 +1850,49 @@ async fn forward_to_devtools(
         "params": params
     });
 
-    let mut b = bridge.lock().await;
-    match b.request(&forward_req).await {
-        Ok(resp) => {
-            if let Some(result) = resp.get("result") {
-                return JsonRpcResponse::success(req.id.clone(), result.clone());
+    for attempt in 0..=usize::from(retry_once) {
+        let response = {
+            let mut b = bridge.lock().await;
+            b.request(&forward_req).await
+        };
+        match response {
+            Ok(resp) => {
+                if let Some(result) = resp.get("result") {
+                    let _ = agent_runtime::note_tool_outcome(
+                        Path::new(workspace_root),
+                        tool_name,
+                        verify_policy,
+                        true,
+                    );
+                    return JsonRpcResponse::success(req.id.clone(), result.clone());
+                }
+                if let Some(error) = resp.get("error") {
+                    let code = error.get("code").and_then(|c| c.as_i64()).unwrap_or(-32000);
+                    let msg = error
+                        .get("message")
+                        .and_then(|m| m.as_str())
+                        .unwrap_or("Unknown error");
+                    let text = format!("DevTools tool error (code {code}): {msg}");
+                    if attempt == 0 && retry_once && transient_tool_error(&text) {
+                        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                        continue;
+                    }
+                    return tool_error_response(req, text);
+                }
+                return tool_error_response(req, "DevTools bridge returned empty response".into());
             }
-            if let Some(error) = resp.get("error") {
-                let code = error.get("code").and_then(|c| c.as_i64()).unwrap_or(-32000);
-                let msg = error
-                    .get("message")
-                    .and_then(|m| m.as_str())
-                    .unwrap_or("Unknown error");
-                return tool_error_response(
-                    req,
-                    format!("DevTools tool error (code {code}): {msg}"),
-                );
+            Err(error) => {
+                let text = format!("DevTools bridge error: {error}");
+                if attempt == 0 && retry_once && transient_tool_error(&text) {
+                    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                    continue;
+                }
+                return tool_error_response(req, text);
             }
-            tool_error_response(req, "DevTools bridge returned empty response".into())
         }
-        Err(e) => tool_error_response(req, format!("DevTools bridge error: {e}")),
     }
+
+    tool_error_response(req, "DevTools retry exhausted".into())
 }
 
 fn format_command_output_events<'a, I>(events: I) -> String
@@ -2623,6 +2784,365 @@ fn activity_failure_reason(response: &JsonRpcResponse, is_error: bool) -> Option
         }
     }
     None
+}
+
+fn handle_agent_status(
+    req: &JsonRpcRequest,
+    workspace_root: &str,
+    tool_mode: ToolMode,
+) -> JsonRpcResponse {
+    let root = Path::new(workspace_root);
+    let state = match agent_runtime::load_state(root) {
+        Ok(state) => state,
+        Err(error) => return tool_error_response(req, error),
+    };
+    let recent_audit = agent_runtime::recent_audit(root);
+    let activity = activity::snapshot();
+    let health = agent_runtime::audit_health(root);
+    let policy = tool_registry::summary(tool_mode.read_only());
+    let text = if state.goal.is_empty() {
+        "No persistent agent task is active.".to_string()
+    } else {
+        format!(
+            "Agent task: {}\nStatus: {}\nPhase: {}\nNext: {}",
+            state.goal,
+            if state.status.is_empty() {
+                "unspecified"
+            } else {
+                &state.status
+            },
+            if state.phase.is_empty() {
+                "unspecified"
+            } else {
+                &state.phase
+            },
+            if state.next_step.is_empty() {
+                "unspecified"
+            } else {
+                &state.next_step
+            },
+        )
+    };
+    tool_success_response_with_structured(
+        req,
+        text,
+        json!({
+            "toolName": "agent_status",
+            "state": state,
+            "recentAudit": recent_audit,
+            "activity": activity,
+            "health": health,
+            "policy": policy,
+        }),
+    )
+}
+
+fn handle_agent_checkpoint(req: &JsonRpcRequest, workspace_root: &str) -> JsonRpcResponse {
+    let arguments = tool_arguments(req);
+    let goal = match optional_string_argument(&arguments, "goal") {
+        Ok(value) => value.map(str::to_string),
+        Err(error) => return tool_error_response(req, error),
+    };
+    let status = match optional_string_argument(&arguments, "status") {
+        Ok(value) => value.map(str::to_string),
+        Err(error) => return tool_error_response(req, error),
+    };
+    let phase = match optional_string_argument(&arguments, "phase") {
+        Ok(value) => value.map(str::to_string),
+        Err(error) => return tool_error_response(req, error),
+    };
+    let next_step = match optional_string_argument(&arguments, "next_step") {
+        Ok(value) => value.map(str::to_string),
+        Err(error) => return tool_error_response(req, error),
+    };
+    let note = match optional_string_argument(&arguments, "note") {
+        Ok(value) => value.map(str::to_string),
+        Err(error) => return tool_error_response(req, error),
+    };
+    let clear_notes = match optional_bool_argument(&arguments, "clear_notes", false) {
+        Ok(value) => value,
+        Err(error) => return tool_error_response(req, error),
+    };
+    if goal.is_none()
+        && status.is_none()
+        && phase.is_none()
+        && next_step.is_none()
+        && note.is_none()
+        && !clear_notes
+    {
+        return tool_error_response(req, "agent_checkpoint requires at least one field".into());
+    }
+
+    match agent_runtime::update_state(
+        Path::new(workspace_root),
+        AgentUpdate {
+            goal,
+            status,
+            phase,
+            next_step,
+            note,
+            clear_notes,
+        },
+    ) {
+        Ok(state) => tool_success_response_with_structured(
+            req,
+            "Agent checkpoint updated.".to_string(),
+            json!({
+                "toolName": "agent_checkpoint",
+                "state": state,
+            }),
+        ),
+        Err(error) => tool_error_response(req, error),
+    }
+}
+
+fn handle_agent_plan(req: &JsonRpcRequest, workspace_root: &str) -> JsonRpcResponse {
+    let arguments = tool_arguments(req);
+    let steps = match arguments.get("steps") {
+        Some(Value::Array(items)) => {
+            let mut steps = Vec::with_capacity(items.len());
+            for (index, item) in items.iter().enumerate() {
+                let Some(step) = item.as_str() else {
+                    return tool_error_response(
+                        req,
+                        format!("Parameter steps[{index}] must be a string"),
+                    );
+                };
+                steps.push(step.to_string());
+            }
+            Some(steps)
+        }
+        Some(_) => return tool_error_response(req, "Parameter steps must be an array".into()),
+        None => None,
+    };
+    let step_index = match optional_usize_argument(&arguments, "step_index") {
+        Ok(value) => value,
+        Err(error) => return tool_error_response(req, error),
+    };
+    let step_status = match optional_string_argument(&arguments, "step_status") {
+        Ok(value) => value.map(str::to_string),
+        Err(error) => return tool_error_response(req, error),
+    };
+    let clear = match optional_bool_argument(&arguments, "clear", false) {
+        Ok(value) => value,
+        Err(error) => return tool_error_response(req, error),
+    };
+
+    match agent_runtime::update_plan(
+        Path::new(workspace_root),
+        PlanUpdate {
+            steps,
+            step_index,
+            step_status,
+            clear,
+        },
+    ) {
+        Ok(state) => tool_success_response_with_structured(
+            req,
+            "Agent plan updated.".to_string(),
+            json!({
+                "toolName": "agent_plan",
+                "state": state,
+            }),
+        ),
+        Err(error) => tool_error_response(req, error),
+    }
+}
+
+fn handle_agent_recover(req: &JsonRpcRequest, workspace_root: &str) -> JsonRpcResponse {
+    let arguments = tool_arguments(req);
+    let requested = match optional_string_argument(&arguments, "action") {
+        Ok(value) => value.unwrap_or("auto"),
+        Err(error) => return tool_error_response(req, error),
+    };
+    if !matches!(requested, "auto" | "inspect" | "rollback_latest" | "resume") {
+        return tool_error_response(
+            req,
+            "action must be one of: auto, inspect, rollback_latest, resume".into(),
+        );
+    }
+
+    let root = Path::new(workspace_root);
+    let state = match agent_runtime::load_state(root) {
+        Ok(state) => state,
+        Err(error) => return tool_error_response(req, error),
+    };
+    let health = agent_runtime::audit_health(root);
+    let health_status = health
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("idle");
+    let matching_checkpoint = if state.verification_pending {
+        checkpoints::list(root)
+            .into_iter()
+            .find(|checkpoint| checkpoint.tool == state.verification_tool)
+    } else {
+        None
+    };
+
+    let recommendation = if state.verification_pending && matching_checkpoint.is_some() {
+        "rollback_latest"
+    } else if !state.verification_pending
+        && matches!(state.status.as_str(), "blocked" | "waiting" | "verifying")
+        && health_status != "unhealthy"
+    {
+        "resume"
+    } else {
+        "blocked"
+    };
+
+    if requested == "inspect" {
+        return tool_success_response_with_structured(
+            req,
+            format!("Recovery recommendation: {recommendation}."),
+            json!({
+                "toolName": "agent_recover",
+                "action": "inspect",
+                "recommendation": recommendation,
+                "state": state,
+            }),
+        );
+    }
+
+    let action = if requested == "auto" {
+        recommendation
+    } else {
+        requested
+    };
+
+    match action {
+        "rollback_latest" => {
+            if !state.verification_pending {
+                return tool_error_response(
+                    req,
+                    "rollback_latest requires pending verification debt".into(),
+                );
+            }
+            let Some(checkpoint) = matching_checkpoint else {
+                let blocked = agent_runtime::block_recovery(root, "checkpoint_missing");
+                return match blocked {
+                    Ok(state) => tool_error_response(
+                        req,
+                        format!(
+                            "No checkpoint matches pending tool '{}'; task blocked for manual review. State: {}",
+                            state.verification_tool, state.status
+                        ),
+                    ),
+                    Err(error) => tool_error_response(req, error),
+                };
+            };
+
+            if let Err(error) =
+                agent_runtime::start_recovery(root, "rollback_latest", &state.verification_tool)
+            {
+                return tool_error_response(req, error);
+            }
+
+            match checkpoints::restore(root, Some(&checkpoint.id)) {
+                Ok((checkpoint, report)) if report.skipped.is_empty() => {
+                    let state = match agent_runtime::finish_recovery(root, true, true, true, None) {
+                        Ok(state) => state,
+                        Err(error) => return tool_error_response(req, error),
+                    };
+                    tool_success_response_with_structured(
+                        req,
+                        format!(
+                            "Recovered by restoring checkpoint {} and resumed the task.",
+                            checkpoint.id
+                        ),
+                        json!({
+                            "toolName": "agent_recover",
+                            "action": "rollback_latest",
+                            "recommendation": "resume",
+                            "checkpointId": checkpoint.id,
+                            "restored": report.restored,
+                            "removed": report.removed,
+                            "skipped": report.skipped,
+                            "state": state,
+                        }),
+                    )
+                }
+                Ok((checkpoint, report)) => {
+                    let _ = agent_runtime::finish_recovery(
+                        root,
+                        false,
+                        false,
+                        false,
+                        Some("restore_incomplete"),
+                    );
+                    tool_error_response(
+                        req,
+                        format!(
+                            "Checkpoint {} restore was incomplete; skipped paths: {}",
+                            checkpoint.id,
+                            report.skipped.join(", ")
+                        ),
+                    )
+                }
+                Err(error) => {
+                    let _ = agent_runtime::finish_recovery(
+                        root,
+                        false,
+                        false,
+                        false,
+                        Some("restore_failed"),
+                    );
+                    tool_error_response(req, format!("Recovery restore failed: {error}"))
+                }
+            }
+        }
+        "resume" => {
+            if state.verification_pending {
+                return tool_error_response(
+                    req,
+                    "resume is blocked while verification debt is pending".into(),
+                );
+            }
+            if !matches!(state.status.as_str(), "blocked" | "waiting" | "verifying") {
+                return tool_error_response(
+                    req,
+                    format!("task status '{}' is not resumable", state.status),
+                );
+            }
+            if health_status == "unhealthy" {
+                let _ = agent_runtime::block_recovery(root, "health_unhealthy");
+                return tool_error_response(
+                    req,
+                    "agent health is unhealthy; automatic resume is blocked".into(),
+                );
+            }
+            if let Err(error) = agent_runtime::start_recovery(root, "resume", "task") {
+                return tool_error_response(req, error);
+            }
+            match agent_runtime::finish_recovery(root, true, false, true, None) {
+                Ok(state) => tool_success_response_with_structured(
+                    req,
+                    "Recovered by resuming the task.".to_string(),
+                    json!({
+                        "toolName": "agent_recover",
+                        "action": "resume",
+                        "recommendation": "continue",
+                        "state": state,
+                    }),
+                ),
+                Err(error) => tool_error_response(req, error),
+            }
+        }
+        "blocked" => {
+            let state = match agent_runtime::block_recovery(root, "no_safe_recovery") {
+                Ok(state) => state,
+                Err(error) => return tool_error_response(req, error),
+            };
+            tool_error_response(
+                req,
+                format!(
+                    "No bounded safe recovery is available; task is blocked. Last target: {}",
+                    state.recovery.last_target
+                ),
+            )
+        }
+        _ => tool_error_response(req, "unsupported recovery action".into()),
+    }
 }
 
 fn handle_checkpoint_list(req: &JsonRpcRequest, workspace_root: &str) -> JsonRpcResponse {
@@ -3591,6 +4111,21 @@ fn read_only_blocked_response(req: &JsonRpcRequest, tool_name: &str) -> JsonRpcR
     )
 }
 
+fn access_blocked_response(
+    req: &JsonRpcRequest,
+    tool_name: &str,
+    required: tool_registry::AccessLevel,
+) -> JsonRpcResponse {
+    tool_error_response(
+        req,
+        format!(
+            "Tool '{tool_name}' requires {} access; current CatDesk policy allows up to {}",
+            required.as_str(),
+            tool_registry::configured_max_access().as_str()
+        ),
+    )
+}
+
 fn tool_arguments(req: &JsonRpcRequest) -> Value {
     req.params.get("arguments").cloned().unwrap_or(json!({}))
 }
@@ -3791,11 +4326,23 @@ Always specify the branch explicitly when using `git push`."#
             .to_string(),
     );
     lines.push(
+        "Tool policy: tools advertise CatDesk policy metadata for category, access level, retry policy, and verification style. Honor the current max access. CatDesk automatically retries supported transient_once read operations once for evident transport/provider failures; do not stack blind duplicate retries. For tools marked observable_state, runtime verification debt blocks task completion until a later successful verification action clears it."
+            .to_string(),
+    );
+    lines.push(
+        "Task lifecycle: use queued/active/waiting/verifying/blocked/done/failed checkpoints when a long task benefits from explicit state. For non-trivial multi-step work, persist a small plan with agent_plan and update step status as work advances. After an observable-state mutation, move to verifying and perform a successful verification action before marking a step or task done."
+            .to_string(),
+    );
+    lines.push(
+        "Recovery: when a task is blocked or a verification step fails, use agent_recover action=auto. Recovery is bounded to two actions per incident, never repeats the same action for the same target, and only restores the matching CatDesk checkpoint. If no safe action exists, keep the task blocked."
+            .to_string(),
+    );
+    lines.push(
         "Workspace safety: inspect git status before editing, preserve pre-existing user changes, and never use reset, checkout, clean, force-push, or recursive deletion unless the user explicitly requested that exact destructive operation. Do not commit or push unless requested."
             .to_string(),
     );
     lines.push(
-        "Context guard: keep command, file, and search output focused. Never dump an entire large file or log into the conversation. Redirect verbose command output to a workspace file, then use search or targeted line ranges to inspect it. After each major milestone, update .catdesk/CURRENT_CONTEXT.md with the user's goal, completed work, key decisions, changed files, validation, and remaining work. Before continuing a long task or after reconnecting, read that checkpoint first."
+        "Context guard: keep command, file, and search output focused. Never dump an entire large file or log into the conversation. Redirect verbose command output to a workspace file, then use search or targeted line ranges to inspect it. For long tasks, call agent_status before resuming after reconnects or context compaction, and use agent_checkpoint after each major milestone with a compact goal/status/phase/next_step. Keep .catdesk/CURRENT_CONTEXT.md for durable human-readable project notes rather than turn-by-turn state."
             .to_string(),
     );
 
@@ -4914,22 +5461,8 @@ fn change_scope_for_request(req: &JsonRpcRequest, workspace_root: &str) -> Chang
 }
 
 fn is_local_destructive_tool(tool_name: &str) -> bool {
-    matches!(
-        tool_name,
-        "run_checks"
-            | "checkpoint_restore"
-            | "run_command"
-            | "root_command"
-            | "start_command"
-            | "poll_command"
-            | "cancel_command"
-            | "git_add"
-            | "git_commit"
-            | "write"
-            | "edit"
-            | "apply_patch"
-            | "delete"
-    )
+    tool_registry::local_policy(tool_name)
+        .is_some_and(|policy| policy.access > tool_registry::AccessLevel::Read)
 }
 
 fn tool_is_read_only(tool: &Value) -> bool {
@@ -4956,15 +5489,35 @@ async fn fetch_devtools_tools(bridge: &Arc<Mutex<DevtoolsBridge>>) -> Option<Vec
     Some(dt_tools)
 }
 
-async fn devtools_tool_is_read_only(
+async fn devtools_tool_descriptor(
     bridge: &Arc<Mutex<DevtoolsBridge>>,
     tool_name: &str,
-) -> Option<bool> {
+) -> Option<Value> {
     let dt_tools = fetch_devtools_tools(bridge).await?;
     dt_tools
-        .iter()
+        .into_iter()
         .find(|tool| tool.get("name").and_then(Value::as_str) == Some(tool_name))
-        .map(tool_is_read_only)
+}
+
+fn transient_tool_error(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    [
+        "timed out",
+        "timeout",
+        "temporar",
+        "connection reset",
+        "connection closed",
+        "connection refused",
+        "channel closed",
+        "too many requests",
+        "rate limit",
+        "http 429",
+        "http 502",
+        "http 503",
+        "http 504",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
 }
 
 fn parse_read_paths(arguments: &Value) -> Result<Vec<String>, String> {
@@ -5405,6 +5958,15 @@ mod tests {
                 "arguments": arguments,
             }),
         }
+    }
+
+    fn tool_response_is_error(response: &JsonRpcResponse) -> bool {
+        response
+            .result
+            .as_ref()
+            .and_then(|result| result.get("isError"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
     }
 
     fn result_text(response: &JsonRpcResponse) -> &str {
@@ -5974,6 +6536,15 @@ mod tests {
         assert!(result_text(&response).contains("cwd must be an absolute path"));
     }
 
+    #[test]
+    fn transient_tool_error_is_narrow_and_transport_focused() {
+        assert!(transient_tool_error("Request timed out (120s)"));
+        assert!(transient_tool_error("HTTP 503 upstream unavailable"));
+        assert!(transient_tool_error("Too many requests"));
+        assert!(!transient_tool_error("invalid parameter"));
+        assert!(!transient_tool_error("permission denied"));
+    }
+
     #[tokio::test]
     async fn multi_tools_list_exposes_run_command_mv_without_move_path_tool() {
         let req = JsonRpcRequest {
@@ -6013,7 +6584,11 @@ mod tests {
                 "git_status",
                 "git_diff",
                 "git_log",
+                "agent_status",
                 "checkpoint_list",
+                "agent_checkpoint",
+                "agent_plan",
+                "agent_recover",
                 "git_add",
                 "git_commit",
                 "write",
@@ -6065,6 +6640,15 @@ mod tests {
             );
             assert!(properties.contains_key("message"));
             assert!(properties.contains_key("success"));
+            let policy = tool
+                .get("_meta")
+                .and_then(|meta| meta.get("catdesk/toolPolicy"))
+                .and_then(Value::as_object)
+                .unwrap_or_else(|| panic!("missing CatDesk tool policy for {name}"));
+            assert!(policy.get("category").and_then(Value::as_str).is_some());
+            assert!(policy.get("access").and_then(Value::as_str).is_some());
+            assert!(policy.get("retry").and_then(Value::as_str).is_some());
+            assert!(policy.get("verify").and_then(Value::as_str).is_some());
             assert!(
                 schema
                     .get("required")
@@ -6078,6 +6662,8 @@ mod tests {
             ("catdesk_instruction", "instructionText"),
             ("read", "files"),
             ("search", "searchResults"),
+            ("agent_status", "health"),
+            ("agent_recover", "recommendation"),
             ("write", "bytesWritten"),
             ("edit", "operationCount"),
             ("delete", "recursive"),
@@ -6383,6 +6969,7 @@ mod tests {
                 "git_status",
                 "git_diff",
                 "git_log",
+                "agent_status",
                 "checkpoint_list",
             ]
         );
@@ -7760,6 +8347,171 @@ mod tests {
         let root = std::env::temp_dir().join(format!("catdesk-mcp-read-{name}-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&root).expect("create workspace");
         root
+    }
+
+    #[tokio::test]
+    async fn observable_write_requires_a_later_verification_action() {
+        let workspace_root = read_workspace("agent-verification");
+        let workspace_root_str = workspace_root.to_string_lossy().into_owned();
+        let command_jobs = CommandJobManager::new();
+
+        agent_runtime::update_state(
+            &workspace_root,
+            AgentUpdate {
+                goal: Some("integration verify gate".into()),
+                status: Some("active".into()),
+                ..AgentUpdate::default()
+            },
+        )
+        .unwrap();
+
+        let write_response = handle_tools_call(
+            &tool_call_request(
+                "write",
+                json!({ "path": "verify.txt", "content": "changed" }),
+            ),
+            &workspace_root_str,
+            1,
+            Mode::Computer,
+            ToolMode::MultiTools,
+            false,
+            &command_jobs,
+            &None,
+        )
+        .await;
+        assert!(!tool_response_is_error(&write_response));
+
+        let pending = agent_runtime::load_state(&workspace_root).unwrap();
+        assert!(pending.verification_pending);
+        assert_eq!(pending.verification_tool, "write");
+        assert!(
+            agent_runtime::update_state(
+                &workspace_root,
+                AgentUpdate {
+                    status: Some("done".into()),
+                    ..AgentUpdate::default()
+                },
+            )
+            .unwrap_err()
+            .contains("verification is still required")
+        );
+
+        agent_runtime::update_state(
+            &workspace_root,
+            AgentUpdate {
+                status: Some("verifying".into()),
+                ..AgentUpdate::default()
+            },
+        )
+        .unwrap();
+
+        let read_response = handle_tools_call(
+            &tool_call_request("read", json!({ "paths": ["verify.txt"] })),
+            &workspace_root_str,
+            1,
+            Mode::Computer,
+            ToolMode::MultiTools,
+            false,
+            &command_jobs,
+            &None,
+        )
+        .await;
+        assert!(!tool_response_is_error(&read_response));
+        assert!(
+            !agent_runtime::load_state(&workspace_root)
+                .unwrap()
+                .verification_pending
+        );
+
+        let done = agent_runtime::update_state(
+            &workspace_root,
+            AgentUpdate {
+                status: Some("done".into()),
+                ..AgentUpdate::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(done.status, "done");
+
+        std::fs::remove_dir_all(workspace_root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn agent_recover_auto_restores_matching_checkpoint_and_resumes() {
+        let workspace_root = read_workspace("agent-recover");
+        let workspace_root_str = workspace_root.to_string_lossy().into_owned();
+        let command_jobs = CommandJobManager::new();
+        std::fs::write(workspace_root.join("recover.txt"), "original").unwrap();
+
+        agent_runtime::update_state(
+            &workspace_root,
+            AgentUpdate {
+                goal: Some("recover integration".into()),
+                status: Some("active".into()),
+                ..AgentUpdate::default()
+            },
+        )
+        .unwrap();
+
+        let write_response = handle_tools_call(
+            &tool_call_request(
+                "write",
+                json!({ "path": "recover.txt", "content": "changed" }),
+            ),
+            &workspace_root_str,
+            1,
+            Mode::Computer,
+            ToolMode::MultiTools,
+            false,
+            &command_jobs,
+            &None,
+        )
+        .await;
+        assert!(!tool_response_is_error(&write_response));
+        assert_eq!(
+            std::fs::read_to_string(workspace_root.join("recover.txt")).unwrap(),
+            "changed"
+        );
+
+        let recover_response = handle_tools_call(
+            &tool_call_request("agent_recover", json!({ "action": "auto" })),
+            &workspace_root_str,
+            1,
+            Mode::Computer,
+            ToolMode::MultiTools,
+            false,
+            &command_jobs,
+            &None,
+        )
+        .await;
+        assert!(!tool_response_is_error(&recover_response));
+        assert_eq!(
+            std::fs::read_to_string(workspace_root.join("recover.txt")).unwrap(),
+            "original"
+        );
+
+        let state = agent_runtime::load_state(&workspace_root).unwrap();
+        assert_eq!(state.status, "active");
+        assert!(!state.verification_pending);
+        assert_eq!(state.recovery.status, "recovered");
+        assert_eq!(state.recovery.attempts, 1);
+        assert_eq!(state.recovery.last_action, "rollback_latest");
+
+        let repeated = handle_tools_call(
+            &tool_call_request("agent_recover", json!({ "action": "rollback_latest" })),
+            &workspace_root_str,
+            1,
+            Mode::Computer,
+            ToolMode::MultiTools,
+            false,
+            &command_jobs,
+            &None,
+        )
+        .await;
+        assert!(tool_response_is_error(&repeated));
+        assert!(result_text(&repeated).contains("verification debt"));
+
+        std::fs::remove_dir_all(workspace_root).unwrap();
     }
 
     #[tokio::test]

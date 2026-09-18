@@ -1,4 +1,5 @@
 mod activity;
+mod agent_runtime;
 mod binagotchy_gen;
 mod browser;
 mod change_tracking;
@@ -20,6 +21,7 @@ mod server;
 mod startup;
 mod state;
 mod theme;
+mod tool_registry;
 mod workspace_tools;
 
 use crossterm::{
