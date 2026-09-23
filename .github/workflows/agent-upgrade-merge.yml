@@ -6,6 +6,8 @@ on:
       - upgrade/0.9.3-agent-preserve
     paths:
       - .github/workflows/agent-upgrade-merge.yml
+      - .github/scripts/resolve-agent-upgrade.py
+      - .github/scripts/fix-0.9.3-command-signatures.py
 
 permissions:
   contents: write
