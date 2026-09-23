@@ -1,0 +1,48 @@
+name: Build KR ARM64
+
+on:
+  push:
+    branches:
+      - catdesk-agent-upgrade
+    paths:
+      - .github/workflows/build-kr-arm64.yml
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04-arm
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal
+
+      - name: Install musl toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+          rustup target add --toolchain stable aarch64-unknown-linux-musl
+
+      - name: Test release
+        run: cargo +stable test --release --locked
+
+      - name: Build ARM64 release
+        run: cargo +stable build --release --locked --target aarch64-unknown-linux-musl
+
+      - name: Stage artifact
+        run: |
+          mkdir -p dist
+          cp target/aarch64-unknown-linux-musl/release/catdesk dist/catdesk-linux-arm64
+          chmod 755 dist/catdesk-linux-arm64
+          sha256sum dist/catdesk-linux-arm64 | tee dist/SHA256SUMS
+          file dist/catdesk-linux-arm64
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: catdesk-0.9.3-agent-linux-arm64
+          path: |
+            dist/catdesk-linux-arm64
+            dist/SHA256SUMS
+          if-no-files-found: error
