@@ -1,0 +1,50 @@
+name: Agent upgrade merge diagnostic
+
+on:
+  push:
+    branches:
+      - upgrade/0.9.3-agent-preserve
+    paths:
+      - .github/workflows/agent-upgrade-merge.yml
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout upgrade branch
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Attempt three-way merge
+        shell: bash
+        run: |
+          set +e
+          git config merge.conflictStyle diff3
+          git merge --no-commit --no-ff upstream-0.9.3
+          status=$?
+          echo "merge_status=$status" >> "$GITHUB_ENV"
+          echo "=== UNMERGED FILES ==="
+          git diff --name-only --diff-filter=U | tee /tmp/unmerged.txt
+          echo "=== STATUS ==="
+          git status --short
+          mkdir -p /tmp/merge-diagnostic
+          cp /tmp/unmerged.txt /tmp/merge-diagnostic/unmerged.txt
+          while IFS= read -r f; do
+            [ -z "$f" ] && continue
+            mkdir -p "/tmp/merge-diagnostic/$(dirname "$f")"
+            cp "$f" "/tmp/merge-diagnostic/$f"
+          done < /tmp/unmerged.txt
+          git diff --cc > /tmp/merge-diagnostic/conflicts.diff
+          git status --porcelain=v1 > /tmp/merge-diagnostic/status.txt
+          exit 0
+
+      - name: Upload merge diagnostic
+        uses: actions/upload-artifact@v4
+        with:
+          name: agent-upgrade-merge-diagnostic
+          path: /tmp/merge-diagnostic
+          if-no-files-found: error
