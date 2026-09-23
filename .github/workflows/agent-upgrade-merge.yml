@@ -23,7 +23,9 @@ jobs:
         shell: bash
         run: |
           set +e
-          git config user.name "CatDesk Upgrade CI"\n          git config user.email "catdesk-upgrade@users.noreply.github.com"\n          git config merge.conflictStyle diff3
+          git config user.name "CatDesk Upgrade CI"
+          git config user.email "catdesk-upgrade@users.noreply.github.com"
+          git config merge.conflictStyle diff3
           git merge --no-commit --no-ff origin/upstream-0.9.3
           status=$?
           echo "merge_status=$status" >> "$GITHUB_ENV"
