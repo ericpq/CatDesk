@@ -1,0 +1,62 @@
+name: Build KR ARM64
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - .github/workflows/build-kr-arm64.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04-arm
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Verify expected baseline
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -q 'version = "0.9.3"' Cargo.toml
+          grep -q 'checkpoint_restore' src/mcp.rs
+          grep -q 'run_checks' src/mcp.rs
+          grep -q 'activity/stream' src/server.rs
+
+      - name: Install Rust and musl
+        shell: bash
+        run: |
+          rustup toolchain install stable --profile minimal
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+          rustup target add --toolchain stable aarch64-unknown-linux-musl
+
+      - name: Build ARM64 release
+        shell: bash
+        run: |
+          cargo +stable build --release --locked --target aarch64-unknown-linux-musl
+
+      - name: Stage and checksum
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp target/aarch64-unknown-linux-musl/release/catdesk dist/catdesk-linux-arm64
+          chmod 755 dist/catdesk-linux-arm64
+          file dist/catdesk-linux-arm64
+          (cd dist && sha256sum catdesk-linux-arm64 > SHA256SUMS)
+          cat dist/SHA256SUMS
+
+      - name: Upload KR artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: catdesk-0.9.3-agent-kr-arm64
+          path: |
+            dist/catdesk-linux-arm64
+            dist/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 14
