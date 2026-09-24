@@ -1,0 +1,43 @@
+name: Validate 0.9.3 Agent upgrade
+
+on:
+  push:
+    branches:
+      - upgrade/0.9.3-agent-preserve
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout upgrade branch
+        uses: actions/checkout@v4
+
+      - name: Verify version and preserved Agent surface
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -q 'version = "0.9.3"' Cargo.toml
+          for file in             src/activity.rs             src/checkpoints.rs             src/checks.rs             src/iyunzhi.rs             src/outline.rs             src/widget/live_monitor.html             docs/AGENT_UPGRADE.md; do
+            test -f "$file" || { echo "Missing Agent file: $file"; exit 1; }
+          done
+          for symbol in             iyunzhi_bi_query outline find_symbol read_symbol apply_patch             checkpoint_list checkpoint_restore run_checks parse_checks             git_status git_diff git_log git_add git_commit; do
+            grep -q "$symbol" src/mcp.rs || { echo "Missing Agent tool: $symbol"; exit 1; }
+          done
+          grep -q 'activity/stream' src/server.rs
+          grep -q 'live_monitor' src/server.rs
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run release tests
+        run: cargo test --release
+
+      - name: Build release binary
+        run: cargo build --release
+
+      - name: Check repository hygiene
+        run: git diff --check
