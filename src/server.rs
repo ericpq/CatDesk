@@ -3,7 +3,7 @@ use axum::{
     body::{Body, Bytes},
     extract::{Form, Path, State},
     http::{HeaderMap, Response, StatusCode, header},
-    response::Json,
+    response::{Json, Sse, sse},
     routing::{delete, get, post},
 };
 use base64::Engine as _;
@@ -14,6 +14,8 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 use tokio::sync::{Mutex, mpsc::UnboundedSender};
+use tokio_stream::StreamExt as _;
+use tokio_stream::wrappers::BroadcastStream;
 
 use crate::command_jobs::CommandJobManager;
 use crate::devtools::DevtoolsBridge;
@@ -25,6 +27,11 @@ use crate::state::{
 };
 
 const STATELESS_FLOW_ID: &str = "stateless";
+
+const LIVE_MONITOR_HTML: &str = include_str!("widget/live_monitor.html");
+/// Long enough that an idle connection is not mistaken for a dead one,
+/// short enough to survive a proxy's idle timeout.
+const ACTIVITY_KEEPALIVE_SECS: u64 = 15;
 
 #[derive(Clone)]
 struct ServerState {
@@ -43,6 +50,12 @@ pub fn router(
     mcp_path: String,
     ui_events: UnboundedSender<ServerUiEvent>,
 ) -> Router {
+    // Reqwest is provider-neutral while ngrok selects AWS-LC. Install the
+    // shared process-level provider before either component initializes TLS.
+    // Repeated router construction in tests is harmless: an already-installed
+    // provider simply makes this return Err, which can be ignored.
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+
     let state = ServerState {
         app: app_state,
         devtools,
@@ -60,6 +73,9 @@ pub fn router(
     let agents_path_state = format!("{secret_prefix}/agents/path-state");
     let token_stats_layout = format!("{secret_prefix}/layout/token-stats");
     let show_detail_mode = format!("{secret_prefix}/layout/show-detail");
+    let activity_path = format!("{secret_prefix}/activity");
+    let live_path = format!("{secret_prefix}/live");
+    let activity_stream_path = format!("{secret_prefix}/activity/stream");
 
     Router::new()
         .route(&health_path, get(health))
@@ -89,6 +105,9 @@ pub fn router(
             &show_detail_mode,
             post(post_show_detail_mode).options(options_show_detail_mode),
         )
+        .route(&activity_path, get(get_activity).options(options_activity))
+        .route(&live_path, get(get_live_monitor))
+        .route(&activity_stream_path, get(get_activity_stream))
         .route(&mcp_path, post(post_mcp_http))
         .route(&mcp_path, get(get_mcp))
         .route(&mcp_path, delete(delete_mcp))
@@ -827,6 +846,15 @@ fn attach_catdesk_instruction_actions(
         json!(binagotchy_action_base_url.clone().unwrap_or_default()),
     );
     widget_payload.insert(
+        "activityUrl".to_string(),
+        json!(
+            public_action_base_url
+                .as_deref()
+                .map(|base| format!("{base}/activity"))
+                .unwrap_or_default()
+        ),
+    );
+    widget_payload.insert(
         "agentsPathModeUrl".to_string(),
         json!(
             public_action_base_url
@@ -1144,6 +1172,78 @@ async fn get_agents_path_state(State(s): State<ServerState>) -> Response<Body> {
         app.workspace_root.clone()
     };
     agents_state_response(&workspace_root)
+}
+
+/// What CatDesk is doing right now. Polled by the widget on a timer, so it is
+/// deliberately cheap: no workspace access, no locks held across an await.
+async fn get_activity(State(s): State<ServerState>) -> Response<Body> {
+    let mut snapshot = crate::activity::full_snapshot();
+    {
+        let app = s.app.lock().await;
+        let mut usage = crate::state::UsageTotals::default();
+        for totals in app.usage_by_model.values() {
+            usage.tool_input_tokens += totals.tool_input_tokens;
+            usage.tool_output_tokens += totals.tool_output_tokens;
+            usage.total_tokens += totals.total_tokens;
+            usage.tool_call_count += totals.tool_call_count;
+        }
+        if let Some(object) = snapshot.as_object_mut() {
+            object.insert(
+                "usage".to_string(),
+                json!({
+                    "toolInputTokens": usage.tool_input_tokens,
+                    "toolOutputTokens": usage.tool_output_tokens,
+                    "totalTokens": usage.total_tokens,
+                    "toolCallCount": usage.tool_call_count,
+                }),
+            );
+        }
+    }
+    with_widget_action_cors(Response::builder())
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(snapshot.to_string()))
+        .unwrap()
+}
+
+/// Activity as it happens, rather than as it looks once a second.
+///
+/// A tool call is often under ten milliseconds, so a polling reader misses
+/// more than ninety-nine percent of them and reports an idle server through a
+/// working session. This emits on every begin and every finish instead.
+///
+/// The payload carries no usage totals: those change slowly and would mean
+/// taking the app lock on a hot path, so the page reads them separately.
+async fn get_activity_stream()
+-> Sse<impl tokio_stream::Stream<Item = Result<sse::Event, std::convert::Infallible>>> {
+    // The first event is the current state, so a page that connects between
+    // calls still renders something. After that every begin and every finish
+    // arrives as its own event, carrying the state as it was at that moment.
+    let initial = tokio_stream::once(crate::activity::snapshot().to_string());
+    let stream = initial
+        .chain(BroadcastStream::new(crate::activity::subscribe()).filter_map(Result::ok))
+        .map(|payload| Ok(sse::Event::default().data(payload)));
+    Sse::new(stream).keep_alive(
+        sse::KeepAlive::new().interval(std::time::Duration::from_secs(ACTIVITY_KEEPALIVE_SECS)),
+    )
+}
+
+/// The monitor page. It reads `/activity` next to itself, so the secret prefix
+/// never has to be hardcoded into the page or injected on the way out.
+async fn get_live_monitor(State(_s): State<ServerState>) -> Response<Body> {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
+        .header(header::CACHE_CONTROL, "no-store")
+        .body(Body::from(LIVE_MONITOR_HTML))
+        .unwrap()
+}
+
+async fn options_activity(State(_s): State<ServerState>) -> Response<Body> {
+    with_widget_action_cors(Response::builder())
+        .status(StatusCode::NO_CONTENT)
+        .body(Body::empty())
+        .unwrap()
 }
 
 async fn options_agents_path_state(State(_s): State<ServerState>) -> Response<Body> {
@@ -1686,7 +1786,7 @@ mod tests {
         }
         let (success, widgets) = tracked.expect("missing bootstrap tools/list event");
         assert!(success);
-        assert_eq!(widgets.len(), 10);
+        assert_eq!(widgets.len(), 23);
         assert_eq!(
             widgets
                 .iter()
@@ -1697,12 +1797,25 @@ mod tests {
                 "start_command",
                 "poll_command",
                 "cancel_command",
+                "run_checks",
+                "parse_checks",
                 "catdesk_instruction",
                 "read",
                 "search",
+                "outline",
+                "find_symbol",
+                "read_symbol",
+                "git_status",
+                "git_diff",
+                "git_log",
+                "checkpoint_list",
+                "git_add",
+                "git_commit",
                 "write",
                 "edit",
+                "apply_patch",
                 "delete",
+                "checkpoint_restore",
             ]
         );
         assert!(widgets.iter().all(|widget| {
@@ -2382,12 +2495,13 @@ mod tests {
         std::fs::create_dir_all(&workspace_root).expect("create workspace");
         std::fs::create_dir_all(&config_root).expect("create config dir");
 
-        let app = AppState::new_for_test(
+        let mut app = AppState::new_for_test(
             8787,
             workspace_root.to_string_lossy().into_owned(),
             config_path.clone(),
         )
         .expect("create app state");
+        app.sandbox_enabled = false;
         let app_state = Arc::new(Mutex::new(app));
         let (ui_tx, _ui_rx) = unbounded_channel();
         let command_jobs = CommandJobManager::new();
@@ -2959,6 +3073,8 @@ async fn post_mcp_inner(
         mode,
         tool_mode,
         set_catdesk_as_co_author,
+        handoff_enabled,
+        sandbox_enabled,
         ngrok_url,
         mcp_path,
         partner_binagotchy_seed,
@@ -2971,6 +3087,8 @@ async fn post_mcp_inner(
             app.mode,
             app.tool_mode,
             app.set_catdesk_as_co_author,
+            app.handoff_enabled,
+            app.sandbox_enabled,
             app.ngrok_url.clone(),
             app.mcp_path(),
             app.partner_binagotchy_seed.clone(),
@@ -3000,6 +3118,8 @@ async fn post_mcp_inner(
         mode,
         tool_mode,
         set_catdesk_as_co_author,
+        handoff_enabled,
+        sandbox_enabled,
         s.catdesk_instruction_called.load(Ordering::Acquire),
         &s.command_jobs,
         &s.devtools,

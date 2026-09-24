@@ -38,10 +38,12 @@ jobs:
         include:
           - runner: ubuntu-22.04
             asset: catdesk-linux-x64
-            binary: target/release/catdesk
+            target: x86_64-unknown-linux-musl
+            binary: target/x86_64-unknown-linux-musl/release/catdesk
           - runner: ubuntu-22.04-arm
             asset: catdesk-linux-arm64
-            binary: target/release/catdesk
+            target: aarch64-unknown-linux-musl
+            binary: target/aarch64-unknown-linux-musl/release/catdesk
           - runner: macos-15-intel
             asset: catdesk-darwin-x64
             binary: target/release/catdesk
@@ -58,8 +60,21 @@ jobs:
       - name: Install Rust
         run: rustup toolchain install stable --profile minimal
 
+      - name: Install musl toolchain
+        if: matrix.target != ''
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+          rustup target add --toolchain stable "${{ matrix.target }}"
+
       - name: Build release binary
-        run: cargo +stable build --release --locked
+        shell: bash
+        run: |
+          if [ -n "${{ matrix.target }}" ]; then
+            cargo +stable build --release --locked --target "${{ matrix.target }}"
+          else
+            cargo +stable build --release --locked
+          fi
 
       - name: Stage binary
         shell: bash
@@ -100,7 +115,27 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          git for-each-ref "refs/tags/${GITHUB_REF_NAME}" --format='%(contents)' > release-notes.md
           gh release create "${GITHUB_REF_NAME}" release/* \
             --title "${GITHUB_REF_NAME}" \
-            --notes-from-tag \
+            --notes-file release-notes.md \
             --verify-tag
+
+  publish-npm:
+    name: Publish npm package
+    needs: release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          registry-url: "https://registry.npmjs.org"
+          package-manager-cache: false
+
+      - run: npm publish

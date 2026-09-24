@@ -1,0 +1,95 @@
+name: Agent upgrade integration
+
+on:
+  push:
+    branches:
+      - upgrade/0.9.3-agent-preserve
+    paths:
+      - .github/workflows/agent-upgrade-merge.yml
+      - .github/scripts/resolve-agent-upgrade.py
+      - .github/scripts/fix-0.9.3-command-signatures.py
+
+permissions:
+  contents: write
+
+jobs:
+  integrate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout upgrade branch
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Merge upstream 0.9.3
+        shell: bash
+        run: |
+          set +e
+          git config user.name "CatDesk Upgrade CI"
+          git config user.email "catdesk-upgrade@users.noreply.github.com"
+          git config merge.conflictStyle diff3
+          git merge --no-commit --no-ff origin/upstream-0.9.3
+          status=$?
+          set -e
+          if [ "$status" -ne 0 ]; then
+            unresolved="$(git diff --name-only --diff-filter=U)"
+            echo "$unresolved"
+            expected="$(printf '%s\n' Cargo.lock Cargo.toml src/main.rs src/mcp.rs src/process_runner.rs)"
+            if [ "$(printf '%s\n' "$unresolved" | sort)" != "$(printf '%s\n' "$expected" | sort)" ]; then
+              echo "Unexpected conflict set"
+              exit 1
+            fi
+          fi
+
+          # Re-resolve the generated lock file after combining both dependency sets.
+          git checkout --theirs Cargo.lock
+          python .github/scripts/resolve-agent-upgrade.py
+          python .github/scripts/fix-0.9.3-command-signatures.py
+          git add Cargo.toml src/main.rs src/mcp.rs src/process_runner.rs Cargo.lock
+
+          if git diff --name-only --diff-filter=U | grep -q .; then
+            echo "Unresolved merge conflicts remain"
+            git diff --name-only --diff-filter=U
+            exit 1
+          fi
+
+      - name: Regenerate dependency lock
+        run: cargo generate-lockfile
+
+      - name: Verify preserved Agent surface
+        shell: bash
+        run: |
+          set -euo pipefail
+          for file in             src/activity.rs             src/checkpoints.rs             src/checks.rs             src/iyunzhi.rs             src/outline.rs             src/widget/live_monitor.html             docs/AGENT_UPGRADE.md; do
+            test -f "$file" || { echo "Missing Agent file: $file"; exit 1; }
+          done
+
+          for symbol in             iyunzhi_bi_query outline find_symbol read_symbol apply_patch             checkpoint_list checkpoint_restore run_checks parse_checks             git_status git_diff git_log git_add git_commit; do
+            grep -q "$symbol" src/mcp.rs || { echo "Missing Agent tool: $symbol"; exit 1; }
+          done
+
+          grep -q 'activity/stream' src/server.rs
+          grep -q 'live_monitor' src/server.rs
+          grep -q 'create_handoff' src/mcp.rs
+          grep -q 'mod handoff' src/main.rs
+          grep -q 'version = "0.9.3"' Cargo.toml
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run full Rust tests
+        run: cargo test --release
+
+      - name: Build release binary
+        run: cargo build --release
+
+      - name: Check patch hygiene
+        run: git diff --check
+
+      - name: Commit integrated upgrade
+        shell: bash
+        run: |
+          git add -A
+          git status --short
+          git commit -m "merge: upgrade to CatDesk 0.9.3 preserving agent layer"
+          git push origin HEAD:upgrade/0.9.3-agent-preserve
