@@ -4,6 +4,8 @@
 
 An open-source tool that lets you use ChatGPT Chat as a local coding agent. No reverse engineering, no API, no Codex, no Work mode. A ChatGPT Plus subscription is enough.
 
+CatDesk core is intentionally domain-agnostic. Company-, vendor-, or industry-specific integrations should live in separate private MCP servers/connectors rather than in the public core. See [Extension boundary](docs/EXTENSIONS.md).
+
 <p align="center">
   <img src="docs/images/catdesk_preview.gif" alt="CatDesk in ChatGPT Web"><br>
   <em>CatDesk in ChatGPT Web</em>

@@ -8,7 +8,6 @@ mod command;
 mod command_jobs;
 mod devtools;
 mod handoff;
-mod iyunzhi;
 #[cfg(target_os = "linux")]
 mod linux_sandbox;
 mod macos_terminal;
