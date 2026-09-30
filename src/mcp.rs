@@ -19,7 +19,6 @@ use crate::command_jobs::{
 };
 use crate::devtools::DevtoolsBridge;
 use crate::handoff;
-use crate::iyunzhi;
 use crate::mascot;
 use crate::outline;
 use crate::state::{
@@ -834,26 +833,6 @@ fn local_tool_output_schema(name: &str) -> Option<Value> {
                 }),
             );
         }
-        "iyunzhi_bi_query" => {
-            for field in ["report", "path", "beginDate", "endDate", "cinema"] {
-                properties.insert(field.to_string(), json!({ "type": ["string", "null"] }));
-            }
-            for field in ["verifiedTemplate", "cinemaFilterApplied", "truncated"] {
-                properties.insert(field.to_string(), json!({ "type": ["boolean", "null"] }));
-            }
-            for field in ["rowsBeforeLocalFilters", "totalItems", "totalMatched"] {
-                properties.insert(
-                    field.to_string(),
-                    json!({ "type": ["integer", "null"], "minimum": 0 }),
-                );
-            }
-            properties.insert(
-                "rows".to_string(),
-                json!({ "type": "array", "items": { "type": "object" } }),
-            );
-            properties.insert("raw".to_string(), json!({}));
-            properties.insert("error".to_string(), json!({ "type": "string" }));
-        }
         "outline" | "read_symbol" => {
             for field in ["path", "language"] {
                 properties.insert(field.to_string(), json!({ "type": "string" }));
@@ -1200,28 +1179,6 @@ async fn handle_tools_list_with_show_detail_mode(
                 "annotations": { "readOnlyHint": true, "openWorldHint": false, "destructiveHint": false }
             }));
         }
-
-        tools.push(json!({
-            "name": "iyunzhi_bi_query",
-            "title": "Query YunZhi BI",
-            "description": "Query the YunZhi cinema BI service using credentials stored only in .catdesk/iyunzhi_session.json on the VPS. The tool never accepts or returns TOKEN/USER_ID/LEASE_CODE. Verified aliases: operating_statistic, category_group_sale, stock_trace, cinema_data. Other documented BI paths are allowed with a generic date/page payload and can be refined through extra. Automatically paginates, resolves cinemaLinkIds for stock_trace, and can filter returned rows locally.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "report": { "type": "string", "description": "Report alias or documented BI path. Verified aliases: operating_statistic, category_group_sale, stock_trace, cinema_data. Documented paths such as /bi/card/rechargeReport are also accepted." },
-                    "begin_date": { "type": "string", "description": "China-local start date YYYY-MM-DD. Required for POST BI reports; not needed for cinema_data." },
-                    "end_date": { "type": "string", "description": "China-local end date YYYY-MM-DD. Defaults to begin_date." },
-                    "cinema": { "type": "string", "description": "Cinema name substring. For stock_trace this is resolved to cinemaLinkIds before querying; for reports returning cinemaName it is applied as a local filter." },
-                    "page_size": { "type": "integer", "minimum": 1, "maximum": 500, "description": "BI page size (default 200)." },
-                    "max_rows": { "type": "integer", "minimum": 1, "maximum": 1000, "description": "Maximum rows returned to ChatGPT after pagination/filtering (default 200)." },
-                    "extra": { "type": "object", "description": "Extra/override JSON fields merged into the POST body for report-specific parameters.", "additionalProperties": true },
-                    "contains": { "type": "object", "description": "Local case-insensitive substring filters applied after fetching, keyed by response field name.", "additionalProperties": { "type": "string" } },
-                    "equals": { "type": "object", "description": "Local exact-value filters applied after fetching, keyed by response field name.", "additionalProperties": true }
-                },
-                "required": ["report"]
-            },
-            "annotations": { "readOnlyHint": true, "openWorldHint": true, "destructiveHint": false }
-        }));
 
         tools.push(catdesk_instruction_tool_descriptor());
         tools.push(json!({
@@ -1675,7 +1632,6 @@ async fn handle_tools_call_with_show_detail_mode(
                     "git_diff" => handle_git_diff(req, workspace_root).await,
                     "git_log" => handle_git_log(req, workspace_root).await,
                     "checkpoint_list" => handle_checkpoint_list(req, workspace_root),
-                    "iyunzhi_bi_query" => handle_iyunzhi_bi_query(req, workspace_root).await,
                     "create_handoff" if handoff_enabled => {
                         handle_create_handoff(req, workspace_root)
                     }
@@ -2818,97 +2774,6 @@ fn handle_checkpoint_restore(req: &JsonRpcRequest, workspace_root: &str) -> Json
             )
         }
         Err(error) => tool_error_response(req, error),
-    }
-}
-
-async fn handle_iyunzhi_bi_query(req: &JsonRpcRequest, workspace_root: &str) -> JsonRpcResponse {
-    let arguments = tool_arguments(req);
-    let report = match required_string_argument(&arguments, "report") {
-        Ok(value) => value.to_string(),
-        Err(error) => return tool_error_response(req, error),
-    };
-    let begin_date = match optional_string_argument(&arguments, "begin_date") {
-        Ok(value) => value.map(str::to_string),
-        Err(error) => return tool_error_response(req, error),
-    };
-    let end_date = match optional_string_argument(&arguments, "end_date") {
-        Ok(value) => value.map(str::to_string),
-        Err(error) => return tool_error_response(req, error),
-    };
-    let cinema = match optional_string_argument(&arguments, "cinema") {
-        Ok(value) => value.map(str::to_string),
-        Err(error) => return tool_error_response(req, error),
-    };
-    let page_size = match optional_usize_argument(&arguments, "page_size") {
-        Ok(value) => value,
-        Err(error) => return tool_error_response(req, error),
-    };
-    let max_rows = match optional_usize_argument(&arguments, "max_rows") {
-        Ok(value) => value,
-        Err(error) => return tool_error_response(req, error),
-    };
-
-    let extra = match arguments.get("extra") {
-        Some(Value::Object(value)) => value.clone(),
-        Some(_) => return tool_error_response(req, "Parameter extra must be an object".into()),
-        None => Map::new(),
-    };
-    let contains = match arguments.get("contains") {
-        Some(Value::Object(value)) => {
-            let mut filters = std::collections::BTreeMap::new();
-            for (field, needle) in value {
-                let Some(needle) = needle.as_str() else {
-                    return tool_error_response(
-                        req,
-                        format!("Parameter contains.{field} must be a string"),
-                    );
-                };
-                filters.insert(field.clone(), needle.to_string());
-            }
-            filters
-        }
-        Some(_) => return tool_error_response(req, "Parameter contains must be an object".into()),
-        None => std::collections::BTreeMap::new(),
-    };
-    let equals = match arguments.get("equals") {
-        Some(Value::Object(value)) => value
-            .iter()
-            .map(|(field, expected)| (field.clone(), expected.clone()))
-            .collect::<std::collections::BTreeMap<_, _>>(),
-        Some(_) => return tool_error_response(req, "Parameter equals must be an object".into()),
-        None => std::collections::BTreeMap::new(),
-    };
-
-    let query = iyunzhi::Query {
-        report,
-        begin_date,
-        end_date,
-        cinema,
-        page_size,
-        max_rows,
-        extra,
-        contains,
-        equals,
-    };
-
-    match iyunzhi::query(Path::new(workspace_root), query).await {
-        Ok(mut structured) => {
-            if let Some(obj) = structured.as_object_mut() {
-                obj.insert("toolName".to_string(), json!("iyunzhi_bi_query"));
-            }
-            let text = serde_json::to_string_pretty(&structured)
-                .unwrap_or_else(|_| "YunZhi BI query succeeded".to_string());
-            tool_success_response_with_structured(req, text, structured)
-        }
-        Err(error) => tool_error_response_with_structured(
-            req,
-            error.clone(),
-            json!({
-                "toolName": "iyunzhi_bi_query",
-                "success": false,
-                "error": error,
-            }),
-        ),
     }
 }
 
@@ -6506,7 +6371,6 @@ mod tests {
                 "cancel_command",
                 "run_checks",
                 "parse_checks",
-                "iyunzhi_bi_query",
                 "catdesk_instruction",
                 "read",
                 "search",
@@ -6882,7 +6746,6 @@ mod tests {
         assert_eq!(
             names,
             vec![
-                "iyunzhi_bi_query",
                 "catdesk_instruction",
                 "read",
                 "search",
@@ -6927,7 +6790,6 @@ mod tests {
         assert_eq!(
             names,
             vec![
-                "iyunzhi_bi_query",
                 "catdesk_instruction",
                 "read",
                 "search",
