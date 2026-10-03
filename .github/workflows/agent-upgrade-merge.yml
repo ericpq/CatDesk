@@ -1,13 +1,16 @@
-name: Agent upgrade integration
+name: Agent-preserving upstream merge
 
 on:
-  push:
-    branches:
-      - upgrade/0.9.3-agent-preserve
-    paths:
-      - .github/workflows/agent-upgrade-merge.yml
-      - .github/scripts/resolve-agent-upgrade.py
-      - .github/scripts/fix-0.9.3-command-signatures.py
+  workflow_dispatch:
+    inputs:
+      upstream_ref:
+        description: Official Xeift/CatDesk tag or branch to merge, for example v0.9.6
+        required: true
+        default: v0.9.5
+      target_branch:
+        description: Fork branch that receives the validated merge
+        required: true
+        default: upgrade/0.9.5-agent-preserve
 
 permissions:
   contents: write
@@ -16,63 +19,69 @@ jobs:
   integrate:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout upgrade branch
+      - name: Checkout fork
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Merge upstream 0.9.3
+      - name: Merge official upstream
         shell: bash
         run: |
-          set +e
+          set -euo pipefail
+          upstream_ref='${{ inputs.upstream_ref }}'
+          target_branch='${{ inputs.target_branch }}'
+          [[ "$upstream_ref" =~ ^[A-Za-z0-9._/-]+$ ]]
+          [[ "$target_branch" =~ ^[A-Za-z0-9._/-]+$ ]]
+
           git config user.name "CatDesk Upgrade CI"
           git config user.email "catdesk-upgrade@users.noreply.github.com"
           git config merge.conflictStyle diff3
-          git merge --no-commit --no-ff origin/upstream-0.9.3
+
+          if git ls-remote --exit-code --heads origin "$target_branch" >/dev/null 2>&1; then
+            git fetch origin "$target_branch"
+            git checkout -B "$target_branch" "origin/$target_branch"
+          else
+            git checkout -B "$target_branch" origin/main
+          fi
+
+          git remote add upstream https://github.com/Xeift/CatDesk.git
+          git fetch upstream "$upstream_ref"
+          upstream_commit="$(git rev-parse FETCH_HEAD)"
+
+          set +e
+          git merge --no-edit "$upstream_commit"
           status=$?
           set -e
           if [ "$status" -ne 0 ]; then
-            unresolved="$(git diff --name-only --diff-filter=U)"
-            echo "$unresolved"
-            expected="$(printf '%s\n' Cargo.lock Cargo.toml src/main.rs src/mcp.rs src/process_runner.rs)"
-            if [ "$(printf '%s\n' "$unresolved" | sort)" != "$(printf '%s\n' "$expected" | sort)" ]; then
-              echo "Unexpected conflict set"
-              exit 1
-            fi
-          fi
-
-          # Re-resolve the generated lock file after combining both dependency sets.
-          git checkout --theirs Cargo.lock
-          python .github/scripts/resolve-agent-upgrade.py
-          python .github/scripts/fix-0.9.3-command-signatures.py
-          git add Cargo.toml src/main.rs src/mcp.rs src/process_runner.rs Cargo.lock
-
-          if git diff --name-only --diff-filter=U | grep -q .; then
-            echo "Unresolved merge conflicts remain"
+            echo "Upstream merge has conflicts. Resolve them locally with CatDesk; CI will not guess."
             git diff --name-only --diff-filter=U
             exit 1
           fi
-
-      - name: Regenerate dependency lock
-        run: cargo generate-lockfile
 
       - name: Verify preserved Agent surface
         shell: bash
         run: |
           set -euo pipefail
-          for file in             src/activity.rs             src/checkpoints.rs             src/checks.rs             src/iyunzhi.rs             src/outline.rs             src/widget/live_monitor.html             docs/AGENT_UPGRADE.md; do
+          for file in \
+            src/activity.rs \
+            src/agent_runtime.rs \
+            src/checkpoints.rs \
+            src/checks.rs \
+            src/outline.rs \
+            src/tool_registry.rs \
+            docs/AGENT_UPGRADE.md; do
             test -f "$file" || { echo "Missing Agent file: $file"; exit 1; }
           done
 
-          for symbol in             iyunzhi_bi_query outline find_symbol read_symbol apply_patch             checkpoint_list checkpoint_restore run_checks parse_checks             git_status git_diff git_log git_add git_commit; do
+          for symbol in \
+            agent_status agent_checkpoint agent_plan agent_recover root_command \
+            outline find_symbol read_symbol apply_patch \
+            checkpoint_list checkpoint_restore run_checks parse_checks \
+            git_status git_diff git_log git_add git_commit; do
             grep -q "$symbol" src/mcp.rs || { echo "Missing Agent tool: $symbol"; exit 1; }
           done
 
-          grep -q 'activity/stream' src/server.rs
-          grep -q 'live_monitor' src/server.rs
-          grep -q 'create_handoff' src/mcp.rs
-          grep -q 'mod handoff' src/main.rs
-          grep -q 'version = "0.9.3"' Cargo.toml
+          test ! -e src/iyunzhi.rs || { echo "Private cinema BI leaked into generic core"; exit 1; }
 
       - name: Check formatting
         run: cargo fmt --all -- --check
@@ -86,10 +95,9 @@ jobs:
       - name: Check patch hygiene
         run: git diff --check
 
-      - name: Commit integrated upgrade
+      - name: Push validated upgrade
         shell: bash
         run: |
-          git add -A
-          git status --short
-          git commit -m "merge: upgrade to CatDesk 0.9.3 preserving agent layer"
-          git push origin HEAD:upgrade/0.9.3-agent-preserve
+          set -euo pipefail
+          target_branch='${{ inputs.target_branch }}'
+          git push origin HEAD:"$target_branch"
