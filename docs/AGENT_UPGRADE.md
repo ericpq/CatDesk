@@ -6,7 +6,8 @@ reasoning loop; CatDesk supplies the tools, the limits, and the guarantees.
 
 ## Tools
 
-Twenty-two, in five groups.
+The generic Agent layer extends the stock CatDesk tool surface without owning
+the model or reasoning loop.
 
 | Group | Tools |
 | --- | --- |
@@ -14,11 +15,13 @@ Twenty-two, in five groups.
 | Navigate | `outline`, `find_symbol`, `read_symbol` |
 | Edit | `write`, `edit`, `delete`, `apply_patch` |
 | Undo | `checkpoint_list`, `checkpoint_restore` |
-| Run | `run_command`, `start_command`, `poll_command`, `cancel_command`, `run_checks` |
+| Run | `run_command`, `root_command`, `start_command`, `poll_command`, `cancel_command`, `run_checks`, `parse_checks` |
 | Git | `git_status`, `git_diff`, `git_log`, `git_add`, `git_commit` |
+| Agent | `agent_status`, `agent_checkpoint`, `agent_plan`, `agent_recover` |
 
-Plus `catdesk_instruction`. In ReadOnly mode only the read, navigate,
-`checkpoint_list` and read-only Git tools are advertised.
+`catdesk_instruction` remains the bootstrap tool. ReadOnly mode keeps the
+read/navigation tools, read-only Git tools, `agent_status`, `checkpoint_list`,
+and compatible stock read-only tools such as `create_handoff`.
 
 ### Navigate
 
@@ -111,6 +114,33 @@ Enforced in code, not by instruction:
 
 The operating guidance still asks for an inspect-plan-act-verify loop, bounded
 retries and checkpoint notes. That part is advice. The list above is not.
+
+## Agent runtime
+
+`agent_status`, `agent_checkpoint`, `agent_plan`, and `agent_recover` persist a
+small task state so ChatGPT can resume non-trivial work after reconnects or
+context compaction. Observable-state mutations create verification debt; a task
+cannot be marked done until a later successful verification action clears it.
+Recovery is bounded and records the actual failure reason needed for replanning.
+Audit files are created lazily only while an Agent task is active, so ordinary
+stock read-only operations do not mutate the workspace.
+
+Tool policy metadata classifies access, retry, and verification behavior. A
+result with `structuredContent.success=false` is treated as a real failed tool
+outcome even when the MCP transport itself succeeded.
+
+## Upstream upgrades
+
+The public fork stays domain-agnostic. Private business integrations belong in
+separate sidecars or deployment layers and must not be merged back into the
+public core.
+
+Official Xeift/CatDesk updates are merged into an `upgrade/<version>-agent-preserve`
+branch. `.github/workflows/agent-upgrade-merge.yml` can perform a clean merge
+and validate the result. If Git reports a conflict, CI stops rather than
+inventing a resolution. Before promotion, the branch must preserve the Agent
+surface, pass formatting and tests, build successfully, and remain free of
+private-domain modules such as cinema BI.
 
 ## Runtime
 

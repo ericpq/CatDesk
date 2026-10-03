@@ -1,4 +1,5 @@
 mod activity;
+mod agent_runtime;
 mod binagotchy_gen;
 mod browser;
 mod change_tracking;
@@ -20,6 +21,7 @@ mod server;
 mod startup;
 mod state;
 mod theme;
+mod tool_registry;
 mod workspace_tools;
 
 use crossterm::{
@@ -70,6 +72,12 @@ const STATUS_LABEL_WIDTH: usize = 19;
 const GPT_5_6_AND_EARLIER_INPUT_USD_PER_1M: f64 = 5.0;
 const GPT_5_6_AND_EARLIER_OUTPUT_USD_PER_1M: f64 = 30.0;
 const PRICE_DISPLAY_DECIMALS: usize = 6;
+const USAGE_VALUE_WIDTHS: [usize; 5] = [5, 5, 5, 5, 12];
+const FLOW_TELEMETRY_TOKEN_WIDTH: usize = 5;
+const FLOW_TELEMETRY_COST_WIDTH: usize = 9;
+const FLOW_TELEMETRY_REQUEST_WIDTH: usize = 3;
+const FLOW_TELEMETRY_ELAPSED_WIDTH: usize = 6;
+const USAGE_COUNT_ANIM_DURATION: Duration = Duration::from_millis(480);
 const NGROK_SETUP_URL: &str = "https://dashboard.ngrok.com/get-started/setup";
 const CHATGPT_CONNECTOR_SETTINGS_URL: &str = "https://chatgpt.com/apps#settings/Connectors";
 const CHATGPT_PLUGIN_SETTINGS_URL: &str = "https://chatgpt.com/#settings/Plugins";
@@ -340,6 +348,44 @@ fn mcp_url_reveal_seconds(remaining: Duration) -> u64 {
         .as_millis()
         .div_ceil(1_000)
         .min(MCP_URL_REVEAL_DURATION.as_secs() as u128) as u64
+}
+
+fn reveal_button_span(label: &str, palette: &theme::Palette, hovered: bool) -> Span<'static> {
+    let style = if hovered {
+        Style::default()
+            .fg(palette.toast_fg)
+            .bg(palette.toast_bg)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+            .fg(palette.primary_fg)
+            .bg(palette.muted_fg)
+            .add_modifier(Modifier::BOLD)
+    };
+    Span::styled(format!(" {label} "), style)
+}
+
+fn reveal_button_hovered(
+    screen_lines: &[String],
+    column: u16,
+    row: u16,
+    ui_language: UiLanguage,
+) -> bool {
+    let Some(line) = screen_lines.get(row as usize) else {
+        return false;
+    };
+    if !(line.contains("MCP Server URL") || line.contains("MCP 伺服器 URL")) {
+        return false;
+    }
+    let label = ui_language.text("Click to reveal", "點擊顯示");
+    let Some(byte_start) = line.find(label) else {
+        return false;
+    };
+    let label_start = terminal_cell_width(&line[..byte_start]);
+    let button_start = label_start.saturating_sub(1);
+    let button_end = label_start + terminal_cell_width(label) + 1;
+    let column = column as usize;
+    (button_start..button_end).contains(&column)
 }
 
 fn post_mcp_path(message: &str) -> Option<&str> {
@@ -704,70 +750,204 @@ fn formatted_usage_values(usage: &UsageTotals, cost_usd: f64) -> [String; 5] {
     ]
 }
 
-fn usage_value_widths(
-    first: &UsageTotals,
-    first_cost_usd: f64,
-    second: &UsageTotals,
-    second_cost_usd: f64,
-) -> [usize; 5] {
-    let first = formatted_usage_values(first, first_cost_usd);
-    let second = formatted_usage_values(second, second_cost_usd);
-    std::array::from_fn(|index| first[index].len().max(second[index].len()))
+#[derive(Clone, Debug)]
+struct UsageAnimationFrame {
+    usage: UsageTotals,
+    cost_usd: f64,
+}
+
+#[derive(Clone, Debug, Default)]
+struct UsageAnimationRow {
+    initialized: bool,
+    from_usage: UsageTotals,
+    target_usage: UsageTotals,
+    from_cost_usd: f64,
+    target_cost_usd: f64,
+    started_at: Option<Instant>,
+}
+
+impl UsageAnimationRow {
+    fn sample_values(&self, now: Instant) -> (UsageTotals, f64) {
+        if !self.initialized {
+            return (UsageTotals::default(), 0.0);
+        }
+
+        let progress = self
+            .started_at
+            .map(|started_at| {
+                (now.saturating_duration_since(started_at).as_secs_f64()
+                    / USAGE_COUNT_ANIM_DURATION.as_secs_f64())
+                .clamp(0.0, 1.0)
+            })
+            .unwrap_or(1.0);
+        let eased = 1.0 - (1.0 - progress).powi(3);
+        let lerp_u64 = |from: u64, target: u64| -> u64 {
+            if target >= from {
+                from.saturating_add(((target - from) as f64 * eased).round() as u64)
+            } else {
+                from.saturating_sub(((from - target) as f64 * eased).round() as u64)
+            }
+        };
+
+        (
+            UsageTotals {
+                tool_input_tokens: lerp_u64(
+                    self.from_usage.tool_input_tokens,
+                    self.target_usage.tool_input_tokens,
+                ),
+                tool_output_tokens: lerp_u64(
+                    self.from_usage.tool_output_tokens,
+                    self.target_usage.tool_output_tokens,
+                ),
+                total_tokens: lerp_u64(
+                    self.from_usage.total_tokens,
+                    self.target_usage.total_tokens,
+                ),
+                tool_call_count: lerp_u64(
+                    self.from_usage.tool_call_count,
+                    self.target_usage.tool_call_count,
+                ),
+            },
+            self.from_cost_usd + (self.target_cost_usd - self.from_cost_usd) * eased,
+        )
+    }
+
+    fn update(
+        &mut self,
+        target_usage: &UsageTotals,
+        target_cost_usd: f64,
+        now: Instant,
+    ) -> UsageAnimationFrame {
+        if !self.initialized {
+            self.initialized = true;
+            self.from_usage = target_usage.clone();
+            self.target_usage = target_usage.clone();
+            self.from_cost_usd = target_cost_usd;
+            self.target_cost_usd = target_cost_usd;
+            return UsageAnimationFrame {
+                usage: target_usage.clone(),
+                cost_usd: target_cost_usd,
+            };
+        }
+
+        let target_changed = target_usage != &self.target_usage
+            || (target_cost_usd - self.target_cost_usd).abs() > f64::EPSILON;
+        if target_changed {
+            let decreased = target_usage.tool_input_tokens < self.target_usage.tool_input_tokens
+                || target_usage.tool_output_tokens < self.target_usage.tool_output_tokens
+                || target_usage.total_tokens < self.target_usage.total_tokens
+                || target_usage.tool_call_count < self.target_usage.tool_call_count
+                || target_cost_usd + f64::EPSILON < self.target_cost_usd;
+
+            if decreased {
+                self.from_usage = target_usage.clone();
+                self.target_usage = target_usage.clone();
+                self.from_cost_usd = target_cost_usd;
+                self.target_cost_usd = target_cost_usd;
+                self.started_at = None;
+            } else {
+                let (current_usage, current_cost_usd) = self.sample_values(now);
+                self.from_usage = current_usage;
+                self.target_usage = target_usage.clone();
+                self.from_cost_usd = current_cost_usd;
+                self.target_cost_usd = target_cost_usd;
+                self.started_at = Some(now);
+            }
+        }
+
+        let (usage, cost_usd) = self.sample_values(now);
+        if self.started_at.is_some_and(|started_at| {
+            now.saturating_duration_since(started_at) >= USAGE_COUNT_ANIM_DURATION
+        }) {
+            self.from_usage = self.target_usage.clone();
+            self.from_cost_usd = self.target_cost_usd;
+            self.started_at = None;
+        }
+
+        UsageAnimationFrame { usage, cost_usd }
+    }
+}
+
+#[derive(Debug, Default)]
+struct UsageAnimationState {
+    session: UsageAnimationRow,
+    all_time: UsageAnimationRow,
+}
+
+impl UsageAnimationState {
+    fn frames(
+        &mut self,
+        session_usage: &UsageTotals,
+        session_cost_usd: f64,
+        all_time_usage: &UsageTotals,
+        all_time_cost_usd: f64,
+        now: Instant,
+    ) -> (UsageAnimationFrame, UsageAnimationFrame) {
+        (
+            self.session.update(session_usage, session_cost_usd, now),
+            self.all_time.update(all_time_usage, all_time_cost_usd, now),
+        )
+    }
+}
+
+fn usage_value_spans(value: &str, width: usize, base_color: Color) -> Vec<Span<'static>> {
+    vec![Span::styled(
+        format!("{value:<width$}"),
+        Style::default().fg(base_color).add_modifier(Modifier::BOLD),
+    )]
 }
 
 fn usage_line(
-    usage: &UsageTotals,
-    cost_usd: f64,
+    frame: &UsageAnimationFrame,
     status_label: Span<'static>,
     palette: &theme::Palette,
     value_widths: &[usize; 5],
     ui_language: UiLanguage,
 ) -> Line<'static> {
+    let annotation_style = Style::default().fg(palette.muted_fg);
     let label_style = Style::default().fg(palette.muted_fg);
-    let value_style = Style::default()
-        .fg(palette.secondary_fg)
-        .add_modifier(Modifier::BOLD);
-    let price_style = Style::default()
-        .fg(palette.success_fg)
-        .add_modifier(Modifier::BOLD);
-    let values = formatted_usage_values(usage, cost_usd);
+    let values = formatted_usage_values(&frame.usage, frame.cost_usd);
 
-    Line::from(vec![
-        status_label,
-        Span::styled("↓", label_style),
-        Span::styled(
-            format!("{:<width$}", values[0], width = value_widths[0]),
-            value_style,
-        ),
-        Span::styled(
-            ui_language.text(" (tool input, llm output)", "（工具輸入、LLM 輸出）"),
-            label_style,
-        ),
-        Span::raw("  "),
-        Span::styled("↑", label_style),
-        Span::styled(
-            format!("{:<width$}", values[1], width = value_widths[1]),
-            value_style,
-        ),
-        Span::raw("  "),
-        Span::styled("Σ", label_style),
-        Span::styled(
-            format!("{:<width$}", values[2], width = value_widths[2]),
-            value_style,
-        ),
-        Span::raw("  "),
-        Span::styled("ƒ", label_style),
-        Span::styled(
-            format!("{:<width$}", values[3], width = value_widths[3]),
-            value_style,
-        ),
-        Span::raw("  "),
-        Span::styled("$", label_style),
-        Span::styled(
-            format!("{:<width$}", values[4], width = value_widths[4]),
-            price_style,
-        ),
-    ])
+    let mut spans = vec![status_label, Span::styled("↓", label_style)];
+    spans.extend(usage_value_spans(
+        &values[0],
+        value_widths[0],
+        palette.secondary_fg,
+    ));
+    spans.push(Span::styled(
+        ui_language.text(" (tool input, llm output)", "（工具輸入、LLM 輸出）"),
+        annotation_style,
+    ));
+    spans.push(Span::raw("  "));
+    spans.push(Span::styled("↑", label_style));
+    spans.extend(usage_value_spans(
+        &values[1],
+        value_widths[1],
+        palette.secondary_fg,
+    ));
+    spans.push(Span::raw("  "));
+    spans.push(Span::styled("Σ", label_style));
+    spans.extend(usage_value_spans(
+        &values[2],
+        value_widths[2],
+        palette.secondary_fg,
+    ));
+    spans.push(Span::raw("  "));
+    spans.push(Span::styled("ƒ", label_style));
+    spans.extend(usage_value_spans(
+        &values[3],
+        value_widths[3],
+        palette.secondary_fg,
+    ));
+    spans.push(Span::raw("  "));
+    spans.push(Span::styled("$", label_style));
+    spans.extend(usage_value_spans(
+        &values[4],
+        value_widths[4],
+        palette.success_fg,
+    ));
+
+    Line::from(spans)
 }
 
 fn flow_lane_left_label(ui_language: UiLanguage) -> &'static str {
@@ -780,8 +960,23 @@ fn flow_call_offset(text: &str, left_label: &str) -> String {
     " ".repeat(terminal_cell_width(left_label) + centered_in_lane)
 }
 
-fn flow_turn_usage_line(
-    flow: &FlowLane,
+fn format_last_tool_call_elapsed(last_tool_call_ms: Option<u128>, now_millis: u128) -> String {
+    let Some(last_tool_call_ms) = last_tool_call_ms else {
+        return "--".to_string();
+    };
+    let elapsed_ms = now_millis.saturating_sub(last_tool_call_ms);
+    if elapsed_ms > 99_000 {
+        "99+ s".to_string()
+    } else {
+        format!("{:.1} s", elapsed_ms as f64 / 1_000.0)
+    }
+}
+
+fn flow_telemetry_line(
+    usage: Option<&UsageTotals>,
+    request_count: u64,
+    last_tool_call_ms: Option<u128>,
+    now_millis: u128,
     palette: &theme::Palette,
     ui_language: UiLanguage,
 ) -> Line<'static> {
@@ -792,41 +987,60 @@ fn flow_turn_usage_line(
     let price_style = Style::default()
         .fg(palette.success_fg)
         .add_modifier(Modifier::BOLD);
+    let meta_value_style = Style::default().fg(palette.title_fg);
 
-    match flow.turn_usage.as_ref() {
-        Some(usage) => {
-            let input = format_token_compact(usage.tool_input_tokens);
-            let output = format_token_compact(usage.tool_output_tokens);
-            let cost = format_usd_compact(estimate_gpt_5_6_and_earlier_usage_cost_usd(usage));
-            let usage_text = format!("↓{input}  ↑{output}  ${cost}");
-            let indent = format!(
-                "    {}",
-                flow_call_offset(&usage_text, flow_lane_left_label(ui_language))
-            );
-            Line::from(vec![
-                Span::raw(indent),
-                Span::styled("↓", label_style),
-                Span::styled(input, value_style),
-                Span::raw("  "),
-                Span::styled("↑", label_style),
-                Span::styled(output, value_style),
-                Span::raw("  "),
-                Span::styled("$", label_style),
-                Span::styled(cost, price_style),
-            ])
-        }
-        None => {
-            let usage_text = "↓--  ↑--  $--";
-            let indent = format!(
-                "    {}",
-                flow_call_offset(usage_text, flow_lane_left_label(ui_language))
-            );
-            Line::from(vec![
-                Span::raw(indent),
-                Span::styled(usage_text, label_style),
-            ])
-        }
-    }
+    let input = usage
+        .map(|usage| format_token_compact(usage.tool_input_tokens))
+        .unwrap_or_else(|| "--".to_string());
+    let output = usage
+        .map(|usage| format_token_compact(usage.tool_output_tokens))
+        .unwrap_or_else(|| "--".to_string());
+    let cost = usage
+        .map(|usage| format_usd_compact(estimate_gpt_5_6_and_earlier_usage_cost_usd(usage)))
+        .unwrap_or_else(|| "--".to_string());
+    let elapsed = format_last_tool_call_elapsed(last_tool_call_ms, now_millis);
+
+    let input_field = format!("{input:<FLOW_TELEMETRY_TOKEN_WIDTH$}");
+    let output_field = format!("{output:<FLOW_TELEMETRY_TOKEN_WIDTH$}");
+    let cost_field = format!("{cost:<FLOW_TELEMETRY_COST_WIDTH$}");
+    let request_field = format!("{request_count:<FLOW_TELEMETRY_REQUEST_WIDTH$}");
+    let elapsed_field = format!("{elapsed:>FLOW_TELEMETRY_ELAPSED_WIDTH$}");
+    let telemetry_text = format!(
+        "↓{input_field}  ↑{output_field}  ${cost_field}  ⟨Req {request_field}· {elapsed_field}⟩"
+    );
+    let indent = format!(
+        "    {}",
+        flow_call_offset(&telemetry_text, flow_lane_left_label(ui_language))
+    );
+
+    let usage_style = if usage.is_some() {
+        value_style
+    } else {
+        label_style
+    };
+    let cost_style = if usage.is_some() {
+        price_style
+    } else {
+        label_style
+    };
+
+    Line::from(vec![
+        Span::raw(indent),
+        Span::styled("↓", label_style),
+        Span::styled(input_field, usage_style),
+        Span::raw("  "),
+        Span::styled("↑", label_style),
+        Span::styled(output_field, usage_style),
+        Span::raw("  "),
+        Span::styled("$", label_style),
+        Span::styled(cost_field, cost_style),
+        Span::raw("  "),
+        Span::styled("⟨Req ", label_style),
+        Span::styled(request_field, meta_value_style),
+        Span::styled("· ", label_style),
+        Span::styled(elapsed_field, meta_value_style),
+        Span::styled("⟩", label_style),
+    ])
 }
 
 fn flow_phase(flow: &FlowLane, now_millis: u128) -> &'static str {
@@ -1930,35 +2144,43 @@ fn draw_chatgpt_connector_refresh_notice(
             ];
             if mcp_url.is_some() {
                 spans.push(Span::raw("  "));
-                let security_text = mcp_url_security_status
-                    .as_deref()
-                    .unwrap_or(ui_language.text("Click to reveal", "點擊顯示"));
-                let security_color = match mcp_url_reveal_remaining {
-                    Some(remaining) if mcp_url_reveal_seconds(remaining) <= 3 => palette.danger_fg,
-                    Some(_) => palette.warning_fg,
-                    None => palette.muted_fg,
-                };
-                spans.push(Span::styled(
-                    security_text.to_string(),
-                    Style::default()
-                        .fg(security_color)
-                        .bg(modal_bg)
-                        .add_modifier(Modifier::BOLD),
-                ));
-                if let Some(remaining) = mcp_url_reveal_remaining {
-                    let (remaining_bar, elapsed_bar) = mcp_url_reveal_bar_segments(remaining);
-                    spans.push(Span::raw("  "));
+                if mcp_url_reveal_remaining.is_none() {
+                    spans.push(reveal_button_span(
+                        ui_language.text("Click to reveal", "點擊顯示"),
+                        &palette,
+                        false,
+                    ));
+                } else {
+                    let security_text = mcp_url_security_status.as_deref().unwrap_or_default();
+                    let security_color = match mcp_url_reveal_remaining {
+                        Some(remaining) if mcp_url_reveal_seconds(remaining) <= 3 => {
+                            palette.danger_fg
+                        }
+                        Some(_) => palette.warning_fg,
+                        None => palette.muted_fg,
+                    };
                     spans.push(Span::styled(
-                        remaining_bar,
+                        security_text.to_string(),
                         Style::default()
                             .fg(security_color)
                             .bg(modal_bg)
                             .add_modifier(Modifier::BOLD),
                     ));
-                    spans.push(Span::styled(
-                        elapsed_bar,
-                        Style::default().fg(palette.muted_fg).bg(modal_bg),
-                    ));
+                    if let Some(remaining) = mcp_url_reveal_remaining {
+                        let (remaining_bar, elapsed_bar) = mcp_url_reveal_bar_segments(remaining);
+                        spans.push(Span::raw("  "));
+                        spans.push(Span::styled(
+                            remaining_bar,
+                            Style::default()
+                                .fg(security_color)
+                                .bg(modal_bg)
+                                .add_modifier(Modifier::BOLD),
+                        ));
+                        spans.push(Span::styled(
+                            elapsed_bar,
+                            Style::default().fg(palette.muted_fg).bg(modal_bg),
+                        ));
+                    }
                 }
             }
             Line::from(spans)
@@ -2853,11 +3075,11 @@ fn render_toast(f: &mut Frame, palette: theme::Palette, msg: &str, pos: (u16, u1
 mod tests {
     use super::state::{AppState, ToolMode, UiLanguage};
     use super::{
-        LogView, draw_chatgpt_connector_refresh_notice, draw_mode_select, draw_settings,
-        draw_tui_header, draw_ui, export_logs_to_dir, key_is_clipboard_paste, localize_log_message,
-        mask_mcp_path_in_log, normalize_ngrok_authtoken_input, pad_right_to_cell_width,
-        parse_terminal_profile_choice, terminal_cell_width, text_input_key_is_cancel, trim_line,
-        wrap_log_message,
+        LogView, UsageAnimationState, draw_chatgpt_connector_refresh_notice, draw_mode_select,
+        draw_settings, draw_tui_header, draw_ui, export_logs_to_dir, key_is_clipboard_paste,
+        localize_log_message, mask_mcp_path_in_log, normalize_ngrok_authtoken_input,
+        pad_right_to_cell_width, parse_terminal_profile_choice, terminal_cell_width,
+        text_input_key_is_cancel, trim_line, wrap_log_message,
     };
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::{Terminal, backend::TestBackend, layout::Rect};
@@ -2956,6 +3178,182 @@ mod tests {
     }
 
     #[test]
+    fn flow_telemetry_renders_request_meta() {
+        let palette = super::theme::resolve("neon").palette;
+        let usage = super::state::UsageTotals {
+            tool_input_tokens: 22,
+            tool_output_tokens: 217,
+            total_tokens: 239,
+            tool_call_count: 1,
+        };
+        let line = super::flow_telemetry_line(
+            Some(&usage),
+            22,
+            Some(10_000),
+            91_600,
+            &palette,
+            UiLanguage::English,
+        );
+        let text = line
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert!(text.contains("⟨Req 22 · 81.6 s⟩"));
+    }
+
+    #[test]
+    fn flow_telemetry_does_not_shift_when_values_gain_digits() {
+        let palette = super::theme::resolve("neon").palette;
+        let before = super::state::UsageTotals {
+            tool_input_tokens: 9,
+            tool_output_tokens: 99,
+            total_tokens: 108,
+            tool_call_count: 1,
+        };
+        let after = super::state::UsageTotals {
+            tool_input_tokens: 10,
+            tool_output_tokens: 100,
+            total_tokens: 110,
+            tool_call_count: 1,
+        };
+
+        let line_text = |usage: &super::state::UsageTotals, requests, now_millis| {
+            super::flow_telemetry_line(
+                Some(usage),
+                requests,
+                Some(10_000),
+                now_millis,
+                &palette,
+                UiLanguage::English,
+            )
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>()
+        };
+
+        let before_text = line_text(&before, 9, 19_900);
+        let after_text = line_text(&after, 10, 20_000);
+        assert_eq!(
+            before_text.chars().take_while(|ch| *ch == ' ').count(),
+            after_text.chars().take_while(|ch| *ch == ' ').count()
+        );
+        assert_eq!(
+            super::terminal_cell_width(&before_text),
+            super::terminal_cell_width(&after_text)
+        );
+    }
+
+    #[test]
+    fn usage_line_columns_do_not_shift_when_values_gain_digits() {
+        let palette = super::theme::resolve("neon").palette;
+        let before = super::UsageAnimationFrame {
+            usage: super::state::UsageTotals {
+                tool_input_tokens: 9,
+                tool_output_tokens: 99,
+                total_tokens: 108,
+                tool_call_count: 9,
+            },
+            cost_usd: 0.001,
+        };
+        let after = super::UsageAnimationFrame {
+            usage: super::state::UsageTotals {
+                tool_input_tokens: 10,
+                tool_output_tokens: 100,
+                total_tokens: 110,
+                tool_call_count: 10,
+            },
+            cost_usd: 0.01,
+        };
+
+        let line_text = |frame: &super::UsageAnimationFrame| {
+            super::usage_line(
+                frame,
+                ratatui::text::Span::raw("Session "),
+                &palette,
+                &super::USAGE_VALUE_WIDTHS,
+                UiLanguage::English,
+            )
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>()
+        };
+
+        let before_text = line_text(&before);
+        let after_text = line_text(&after);
+        for marker in ['↑', 'Σ', 'ƒ', '$'] {
+            assert_eq!(
+                before_text.find(marker),
+                after_text.find(marker),
+                "{marker} column shifted"
+            );
+        }
+        assert_eq!(
+            super::terminal_cell_width(&before_text),
+            super::terminal_cell_width(&after_text)
+        );
+    }
+
+    #[test]
+    fn reveal_button_uses_compact_normal_and_hover_styles() {
+        let palette = super::theme::resolve("neon").palette;
+
+        let normal = super::reveal_button_span("Click to reveal", &palette, false);
+        assert_eq!(normal.content.as_ref(), " Click to reveal ");
+        assert_eq!(normal.style.fg, Some(palette.primary_fg));
+        assert_eq!(normal.style.bg, Some(palette.muted_fg));
+
+        let hovered = super::reveal_button_span("Click to reveal", &palette, true);
+        assert_eq!(hovered.content.as_ref(), " Click to reveal ");
+        assert_eq!(hovered.style.fg, Some(palette.toast_fg));
+        assert_eq!(hovered.style.bg, Some(palette.toast_bg));
+        assert!(
+            hovered
+                .style
+                .add_modifier
+                .contains(ratatui::style::Modifier::BOLD)
+        );
+    }
+
+    #[test]
+    fn reveal_button_hover_detects_only_button_cells() {
+        let line = "  MCP Server URL  ▓▓▓▓  Click to reveal  ";
+        let lines = vec![line.to_string()];
+        let label_start = super::terminal_cell_width("  MCP Server URL  ▓▓▓▓  ");
+        assert!(super::reveal_button_hovered(
+            &lines,
+            label_start as u16,
+            0,
+            UiLanguage::English,
+        ));
+        assert!(!super::reveal_button_hovered(
+            &lines,
+            0,
+            0,
+            UiLanguage::English,
+        ));
+    }
+
+    #[test]
+    fn formats_last_tool_call_elapsed() {
+        assert_eq!(super::format_last_tool_call_elapsed(None, 12_300), "--");
+        assert_eq!(
+            super::format_last_tool_call_elapsed(Some(10_000), 22_300),
+            "12.3 s"
+        );
+        assert_eq!(
+            super::format_last_tool_call_elapsed(Some(1_000), 100_000),
+            "99.0 s"
+        );
+        assert_eq!(
+            super::format_last_tool_call_elapsed(Some(1_000), 100_001),
+            "99+ s"
+        );
+    }
+
+    #[test]
     fn main_dashboard_renders_traditional_chinese() {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -2974,6 +3372,7 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(180, 44)).expect("create terminal");
         let mut log_view = None;
         let revealed_logs = HashMap::new();
+        let mut usage_animation = UsageAnimationState::default();
         terminal
             .draw(|frame| {
                 draw_ui(
@@ -2984,7 +3383,9 @@ mod tests {
                     &mut log_view,
                     None,
                     None,
+                    false,
                     &revealed_logs,
+                    &mut usage_animation,
                 )
             })
             .expect("draw main dashboard");
@@ -3005,7 +3406,7 @@ mod tests {
             "選取的瀏覽器",
             "等待連線",
             "你的電腦",
-            "請求",
+            "Req",
             "按鍵",
             "離開",
             "捲動",
@@ -5102,7 +5503,9 @@ async fn run_tui(
     #[allow(unused_assignments)]
     let mut last_mcp_url: Option<String> = None;
     let mut mcp_url_revealed_until: Option<Instant> = None;
+    let mut mcp_reveal_button_hovered = false;
     let mut log_secret_revealed_until: HashMap<u64, Instant> = HashMap::new();
+    let mut usage_animation = UsageAnimationState::default();
 
     loop {
         {
@@ -5136,7 +5539,9 @@ async fn run_tui(
                     &mut latest_log_view,
                     toast_ref,
                     reveal_remaining,
+                    mcp_reveal_button_hovered,
                     &log_secret_revealed_until,
+                    &mut usage_animation,
                 );
 
                 if let Some(((c0, r0), (c1, r1))) = selection.range() {
@@ -5429,6 +5834,14 @@ async fn run_tui(
                             }
                         }
                     }
+                    MouseEventKind::Moved => {
+                        mcp_reveal_button_hovered = reveal_button_hovered(
+                            &screen_lines,
+                            mouse.column,
+                            mouse.row,
+                            current_ui_language,
+                        );
+                    }
                     MouseEventKind::ScrollUp => {
                         if log_follow_tail {
                             log_follow_tail = false;
@@ -5465,7 +5878,9 @@ fn draw_ui(
     log_view: &mut Option<LogView>,
     toast: Option<(&str, (u16, u16))>,
     mcp_url_reveal_remaining: Option<Duration>,
+    mcp_reveal_button_hovered: bool,
     log_secret_revealed_until: &HashMap<u64, Instant>,
+    usage_animation: &mut UsageAnimationState,
 ) {
     let palette = app.current_theme().palette;
     let ui_language = app.ui_language;
@@ -5596,18 +6011,6 @@ fn draw_ui(
     let lane_for = |active: bool, flow: Option<&FlowLane>| -> Vec<Span<'static>> {
         flow_lane_spans(active, flow, &palette, now_millis)
     };
-    let request_stats_for = |app: &AppState| -> Vec<Span<'static>> {
-        vec![
-            Span::styled(
-                ui_language.text("  Requests ", "  請求 "),
-                Style::default().fg(palette.muted_fg),
-            ),
-            Span::styled(
-                app.request_count.to_string(),
-                Style::default().fg(palette.title_fg),
-            ),
-        ]
-    };
     let status_label_style = Style::default()
         .fg(palette.primary_fg)
         .add_modifier(Modifier::BOLD);
@@ -5624,11 +6027,13 @@ fn draw_ui(
     let session_usage_cost_usd =
         estimate_gpt_5_6_and_earlier_usage_cost_usd(&app.session_usage_totals);
     let all_time_usage_cost_usd = estimate_all_time_usage_cost_usd(app);
-    let usage_widths = usage_value_widths(
+    let usage_widths = USAGE_VALUE_WIDTHS;
+    let (session_usage_frame, all_time_usage_frame) = usage_animation.frames(
         &app.session_usage_totals,
         session_usage_cost_usd,
         &all_time_usage_totals,
         all_time_usage_cost_usd,
+        Instant::now(),
     );
     let mut status_lines: Vec<Line> = vec![
         Line::from(vec![
@@ -5700,33 +6105,41 @@ fn draw_ui(
             ];
             if has_url {
                 spans.push(Span::raw("  "));
-                let security_text = mcp_url_security_status
-                    .as_deref()
-                    .unwrap_or(ui_language.text("Click to reveal", "點擊顯示"));
-                let security_color = match mcp_url_reveal_remaining {
-                    Some(remaining) if mcp_url_reveal_seconds(remaining) <= 3 => palette.danger_fg,
-                    Some(_) => palette.warning_fg,
-                    None => palette.muted_fg,
-                };
-                spans.push(Span::styled(
-                    security_text.to_string(),
-                    Style::default()
-                        .fg(security_color)
-                        .add_modifier(Modifier::BOLD),
-                ));
-                if let Some(remaining) = mcp_url_reveal_remaining {
-                    let (remaining_bar, elapsed_bar) = mcp_url_reveal_bar_segments(remaining);
-                    spans.push(Span::raw("  "));
+                if mcp_url_reveal_remaining.is_none() {
+                    spans.push(reveal_button_span(
+                        ui_language.text("Click to reveal", "點擊顯示"),
+                        &palette,
+                        mcp_reveal_button_hovered,
+                    ));
+                } else {
+                    let security_text = mcp_url_security_status.as_deref().unwrap_or_default();
+                    let security_color = match mcp_url_reveal_remaining {
+                        Some(remaining) if mcp_url_reveal_seconds(remaining) <= 3 => {
+                            palette.danger_fg
+                        }
+                        Some(_) => palette.warning_fg,
+                        None => palette.muted_fg,
+                    };
                     spans.push(Span::styled(
-                        remaining_bar,
+                        security_text.to_string(),
                         Style::default()
                             .fg(security_color)
                             .add_modifier(Modifier::BOLD),
                     ));
-                    spans.push(Span::styled(
-                        elapsed_bar,
-                        Style::default().fg(palette.muted_fg),
-                    ));
+                    if let Some(remaining) = mcp_url_reveal_remaining {
+                        let (remaining_bar, elapsed_bar) = mcp_url_reveal_bar_segments(remaining);
+                        spans.push(Span::raw("  "));
+                        spans.push(Span::styled(
+                            remaining_bar,
+                            Style::default()
+                                .fg(security_color)
+                                .add_modifier(Modifier::BOLD),
+                        ));
+                        spans.push(Span::styled(
+                            elapsed_bar,
+                            Style::default().fg(palette.muted_fg),
+                        ));
+                    }
                 }
             }
             Line::from(spans)
@@ -5775,16 +6188,14 @@ fn draw_ui(
             Line::from(spans)
         },
         usage_line(
-            &app.session_usage_totals,
-            session_usage_cost_usd,
+            &session_usage_frame,
             status_label(ui_language.text("Session", "本次工作階段")),
             &palette,
             &usage_widths,
             ui_language,
         ),
         usage_line(
-            &all_time_usage_totals,
-            all_time_usage_cost_usd,
+            &all_time_usage_frame,
             status_label(ui_language.text("All-time", "累計")),
             &palette,
             &usage_widths,
@@ -5851,9 +6262,15 @@ fn draw_ui(
             ];
             row.extend(lane);
             row.push(Span::styled("ChatGPT Web", chatgpt_role_style));
-            row.push(Span::styled("  ", Style::default().fg(palette.muted_fg)));
-            row.extend(request_stats_for(app));
             status_lines.push(Line::from(row));
+            status_lines.push(flow_telemetry_line(
+                None,
+                app.request_count,
+                app.last_tool_call_ms,
+                now_millis,
+                &palette,
+                ui_language,
+            ));
         } else {
             for flow in app
                 .flows
@@ -5880,10 +6297,15 @@ fn draw_ui(
                 ];
                 row.extend(lane);
                 row.push(Span::styled("ChatGPT Web", chatgpt_role_style));
-                row.push(Span::styled("  ", Style::default().fg(palette.muted_fg)));
-                row.extend(request_stats_for(app));
                 status_lines.push(Line::from(row));
-                status_lines.push(flow_turn_usage_line(flow, &palette, ui_language));
+                status_lines.push(flow_telemetry_line(
+                    flow.turn_usage.as_ref(),
+                    app.request_count,
+                    app.last_tool_call_ms,
+                    now_millis,
+                    &palette,
+                    ui_language,
+                ));
             }
         }
     }
@@ -6009,36 +6431,43 @@ fn draw_ui(
                     ];
                     if has_url {
                         spans.push(Span::raw("  "));
-                        let security_text = mcp_url_security_status
-                            .as_deref()
-                            .unwrap_or(ui_language.text("Click to reveal", "點擊顯示"));
-                        let security_color = match mcp_url_reveal_remaining {
-                            Some(remaining) if mcp_url_reveal_seconds(remaining) <= 3 => {
-                                palette.danger_fg
-                            }
-                            Some(_) => palette.warning_fg,
-                            None => palette.muted_fg,
-                        };
-                        spans.push(Span::styled(
-                            security_text.to_string(),
-                            Style::default()
-                                .fg(security_color)
-                                .add_modifier(Modifier::BOLD),
-                        ));
-                        if let Some(remaining) = mcp_url_reveal_remaining {
-                            let (remaining_bar, elapsed_bar) =
-                                mcp_url_reveal_bar_segments(remaining);
-                            spans.push(Span::raw("  "));
+                        if mcp_url_reveal_remaining.is_none() {
+                            spans.push(reveal_button_span(
+                                ui_language.text("Click to reveal", "點擊顯示"),
+                                &palette,
+                                mcp_reveal_button_hovered,
+                            ));
+                        } else {
+                            let security_text =
+                                mcp_url_security_status.as_deref().unwrap_or_default();
+                            let security_color = match mcp_url_reveal_remaining {
+                                Some(remaining) if mcp_url_reveal_seconds(remaining) <= 3 => {
+                                    palette.danger_fg
+                                }
+                                Some(_) => palette.warning_fg,
+                                None => palette.muted_fg,
+                            };
                             spans.push(Span::styled(
-                                remaining_bar,
+                                security_text.to_string(),
                                 Style::default()
                                     .fg(security_color)
                                     .add_modifier(Modifier::BOLD),
                             ));
-                            spans.push(Span::styled(
-                                elapsed_bar,
-                                Style::default().fg(palette.muted_fg),
-                            ));
+                            if let Some(remaining) = mcp_url_reveal_remaining {
+                                let (remaining_bar, elapsed_bar) =
+                                    mcp_url_reveal_bar_segments(remaining);
+                                spans.push(Span::raw("  "));
+                                spans.push(Span::styled(
+                                    remaining_bar,
+                                    Style::default()
+                                        .fg(security_color)
+                                        .add_modifier(Modifier::BOLD),
+                                ));
+                                spans.push(Span::styled(
+                                    elapsed_bar,
+                                    Style::default().fg(palette.muted_fg),
+                                ));
+                            }
                         }
                     }
                     Line::from(spans)
