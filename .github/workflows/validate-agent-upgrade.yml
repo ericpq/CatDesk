@@ -1,9 +1,12 @@
-name: Validate 0.9.3 Agent upgrade
+name: Validate Agent-preserving CatDesk
 
 on:
   push:
     branches:
-      - upgrade/0.9.3-agent-preserve
+      - main
+      - catdesk-agent-upgrade
+      - 'upgrade/**'
+  pull_request:
   workflow_dispatch:
 
 permissions:
@@ -13,22 +16,39 @@ jobs:
   validate:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout upgrade branch
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Verify version and preserved Agent surface
+      - name: Verify generic Agent surface
         shell: bash
         run: |
           set -euo pipefail
-          grep -q 'version = "0.9.3"' Cargo.toml
-          for file in             src/activity.rs             src/checkpoints.rs             src/checks.rs             src/iyunzhi.rs             src/outline.rs             src/widget/live_monitor.html             docs/AGENT_UPGRADE.md; do
+          version="$(sed -nE 's/^version = \"([^\"]+)\"/\1/p' Cargo.toml | head -n1)"
+          test -n "$version"
+          echo "CatDesk version=$version"
+
+          for file in \
+            src/activity.rs \
+            src/agent_runtime.rs \
+            src/checkpoints.rs \
+            src/checks.rs \
+            src/outline.rs \
+            src/tool_registry.rs \
+            docs/AGENT_UPGRADE.md; do
             test -f "$file" || { echo "Missing Agent file: $file"; exit 1; }
           done
-          for symbol in             iyunzhi_bi_query outline find_symbol read_symbol apply_patch             checkpoint_list checkpoint_restore run_checks parse_checks             git_status git_diff git_log git_add git_commit; do
+
+          for symbol in \
+            agent_status agent_checkpoint agent_plan agent_recover root_command \
+            outline find_symbol read_symbol apply_patch \
+            checkpoint_list checkpoint_restore run_checks parse_checks \
+            git_status git_diff git_log git_add git_commit; do
             grep -q "$symbol" src/mcp.rs || { echo "Missing Agent tool: $symbol"; exit 1; }
           done
+
+          test ! -e src/iyunzhi.rs || { echo "Private cinema BI leaked into generic core"; exit 1; }
           grep -q 'activity/stream' src/server.rs
-          grep -q 'live_monitor' src/server.rs
+          grep -q 'mod handoff' src/main.rs
 
       - name: Check formatting
         run: cargo fmt --all -- --check
