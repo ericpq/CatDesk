@@ -5,6 +5,9 @@ on:
     branches:
       - main
     paths:
+      - Cargo.toml
+      - Cargo.lock
+      - 'src/**'
       - .github/workflows/build-kr-arm64.yml
   workflow_dispatch:
 
@@ -18,14 +21,21 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Verify expected baseline
+      - name: Verify Agent baseline
+        id: meta
         shell: bash
         run: |
           set -euo pipefail
-          grep -q 'version = "0.9.3"' Cargo.toml
+          version="$(sed -nE 's/^version = \"([^\"]+)\"/\1/p' Cargo.toml | head -n1)"
+          test -n "$version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          test -f src/agent_runtime.rs
+          test -f src/tool_registry.rs
+          grep -q 'agent_recover' src/mcp.rs
           grep -q 'checkpoint_restore' src/mcp.rs
           grep -q 'run_checks' src/mcp.rs
           grep -q 'activity/stream' src/server.rs
+          test ! -e src/iyunzhi.rs
 
       - name: Install Rust and musl
         shell: bash
@@ -54,7 +64,7 @@ jobs:
       - name: Upload KR artifact
         uses: actions/upload-artifact@v4
         with:
-          name: catdesk-0.9.3-agent-kr-arm64
+          name: catdesk-${{ steps.meta.outputs.version }}-agent-kr-arm64
           path: |
             dist/catdesk-linux-arm64
             dist/SHA256SUMS
