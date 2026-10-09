@@ -1809,13 +1809,7 @@ async fn handle_tools_call_with_show_detail_mode(
     let failure_reason = activity_failure_reason(&response, is_error);
     activity_guard.set_result(!is_error, failure_reason.clone());
     if let Some(policy) = tool_registry::local_policy(&tool_name) {
-        let _ = agent_runtime::note_tool_outcome(
-            Path::new(workspace_root),
-            &tool_name,
-            policy.verify,
-            !is_error,
-            failure_reason.as_deref(),
-        );
+        response = record_agent_outcome(response, workspace_root, &tool_name, policy.verify);
     }
     let _ = agent_runtime::record_tool_call(
         Path::new(workspace_root),
@@ -1915,14 +1909,12 @@ async fn forward_to_devtools(
         match response {
             Ok(resp) => {
                 if let Some(result) = resp.get("result") {
-                    let _ = agent_runtime::note_tool_outcome(
-                        Path::new(workspace_root),
+                    return record_agent_outcome(
+                        JsonRpcResponse::success(req.id.clone(), result.clone()),
+                        workspace_root,
                         tool_name,
                         verify_policy,
-                        true,
-                        None,
                     );
-                    return JsonRpcResponse::success(req.id.clone(), result.clone());
                 }
                 if let Some(error) = resp.get("error") {
                     let code = error.get("code").and_then(|c| c.as_i64()).unwrap_or(-32000);
@@ -1935,24 +1927,20 @@ async fn forward_to_devtools(
                         tokio::time::sleep(std::time::Duration::from_millis(150)).await;
                         continue;
                     }
-                    let _ = agent_runtime::note_tool_outcome(
-                        Path::new(workspace_root),
+                    return record_agent_outcome(
+                        tool_error_response(req, text),
+                        workspace_root,
                         tool_name,
                         verify_policy,
-                        false,
-                        Some(&text),
                     );
-                    return tool_error_response(req, text);
                 }
                 let text = "DevTools bridge returned empty response".to_string();
-                let _ = agent_runtime::note_tool_outcome(
-                    Path::new(workspace_root),
+                return record_agent_outcome(
+                    tool_error_response(req, text),
+                    workspace_root,
                     tool_name,
                     verify_policy,
-                    false,
-                    Some(&text),
                 );
-                return tool_error_response(req, text);
             }
             Err(error) => {
                 let text = format!("DevTools bridge error: {error}");
@@ -1960,27 +1948,23 @@ async fn forward_to_devtools(
                     tokio::time::sleep(std::time::Duration::from_millis(150)).await;
                     continue;
                 }
-                let _ = agent_runtime::note_tool_outcome(
-                    Path::new(workspace_root),
+                return record_agent_outcome(
+                    tool_error_response(req, text),
+                    workspace_root,
                     tool_name,
                     verify_policy,
-                    false,
-                    Some(&text),
                 );
-                return tool_error_response(req, text);
             }
         }
     }
 
     let text = "DevTools retry exhausted".to_string();
-    let _ = agent_runtime::note_tool_outcome(
-        Path::new(workspace_root),
+    record_agent_outcome(
+        tool_error_response(req, text),
+        workspace_root,
         tool_name,
         verify_policy,
-        false,
-        Some(&text),
-    );
-    tool_error_response(req, text)
+    )
 }
 
 fn format_command_output_events<'a, I>(events: I) -> String
@@ -2878,6 +2862,40 @@ fn tool_response_failed(response: &JsonRpcResponse) -> bool {
         .and_then(|structured| structured.get("success"))
         .and_then(Value::as_bool)
         == Some(false)
+}
+
+fn record_agent_outcome(
+    mut response: JsonRpcResponse,
+    workspace_root: &str,
+    tool_name: &str,
+    verify_policy: &str,
+) -> JsonRpcResponse {
+    let failed = tool_response_failed(&response);
+    let reason = activity_failure_reason(&response, failed);
+    if let Err(error) = agent_runtime::note_tool_outcome(
+        Path::new(workspace_root),
+        tool_name,
+        verify_policy,
+        !failed,
+        reason.as_deref(),
+    ) {
+        let warning = format!(
+            "Agent safety state could not be saved: {error}. The tool outcome is unchanged; do not repeat a completed mutation. Repair state storage and verify before marking the task done."
+        );
+        if let Some(result) = response.result.as_mut() {
+            if let Some(structured) = result
+                .get_mut("structuredContent")
+                .and_then(Value::as_object_mut)
+            {
+                structured.insert("agentStateWarning".into(), json!(warning));
+            }
+            if let Some(content) = result.get_mut("content").and_then(Value::as_array_mut) {
+                content.push(json!({ "type": "text", "text": warning }));
+            }
+            result["_meta"]["catdesk/agentStateWarning"] = json!(warning);
+        }
+    }
+    response
 }
 
 fn activity_failure_reason(response: &JsonRpcResponse, is_error: bool) -> Option<String> {
@@ -4434,7 +4452,7 @@ Always specify the branch explicitly when using `git push`."#
             .to_string(),
     );
     lines.push(
-        "Task lifecycle: use queued/active/waiting/verifying/blocked/done/failed checkpoints when a long task benefits from explicit state. For non-trivial multi-step work, persist a small plan with agent_plan and update step status as work advances. After an observable-state mutation, move to verifying and perform a successful verification action before marking a step or task done."
+        "Task lifecycle: use queued/active/waiting/verifying/blocked/done/failed checkpoints when a long task benefits from explicit state. For non-trivial multi-step work, persist a small plan with agent_plan and update step status as work advances. After an observable-state mutation, move to verifying and perform a successful run_checks or parse_checks verdict before marking a step or task done. Reads and running command jobs do not clear verification debt."
             .to_string(),
     );
     lines.push(
@@ -9047,6 +9065,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn state_save_failure_is_visible_without_repeating_a_completed_write() {
+        let root = read_workspace("state-save-warning");
+        agent_runtime::update_state(
+            &root,
+            AgentUpdate {
+                goal: Some("persist safety state".into()),
+                status: Some("active".into()),
+                ..AgentUpdate::default()
+            },
+        )
+        .unwrap();
+        std::fs::create_dir(root.join(".catdesk/agent_state.json.tmp")).unwrap();
+        let response = handle_tools_call(
+            &tool_call_request(
+                "write",
+                json!({"path": "changed.txt", "content": "completed"}),
+            ),
+            &root.to_string_lossy(),
+            1,
+            Mode::Computer,
+            ToolMode::MultiTools,
+            false,
+            &CommandJobManager::new(),
+            &None,
+        )
+        .await;
+        assert!(!tool_response_is_error(&response));
+        assert_eq!(
+            std::fs::read_to_string(root.join("changed.txt")).unwrap(),
+            "completed"
+        );
+        let result = response.result.as_ref().unwrap();
+        assert!(
+            result["structuredContent"]["agentStateWarning"]
+                .as_str()
+                .unwrap()
+                .contains("do not repeat")
+        );
+        assert!(result["_meta"]["catdesk/agentStateWarning"].is_string());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
     async fn observable_write_requires_a_later_verification_action() {
         let workspace_root = read_workspace("agent-verification");
         let workspace_root_str = workspace_root.to_string_lossy().into_owned();
@@ -9103,7 +9164,10 @@ mod tests {
         .unwrap();
 
         let read_response = handle_tools_call(
-            &tool_call_request("read", json!({ "paths": ["verify.txt"] })),
+            &tool_call_request(
+                "run_checks",
+                json!({ "kind": "generic", "command": "test \"$(cat verify.txt)\" = changed" }),
+            ),
             &workspace_root_str,
             1,
             Mode::Computer,

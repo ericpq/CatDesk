@@ -142,6 +142,17 @@ inventing a resolution. Before promotion, the branch must preserve the Agent
 surface, pass formatting and tests, build successfully, and remain free of
 private-domain modules such as cinema BI.
 
+## Agent reliability
+
+State updates are serialized within the service process. A failed state save is
+reported as an Agent safety warning without changing or retrying the underlying
+tool outcome. After a mutation, set the task to `verifying` and obtain a successful
+`run_checks` or `parse_checks` verdict before marking it done. Ordinary reads,
+Git history and running command jobs cannot clear pending verification.
+
+Checkpoint restore rejects workspace-root paths, internal storage targets,
+changed symlinks, non-numeric blob references and mismatched manifest IDs.
+
 ## Runtime
 
 Reqwest uses its provider-neutral Rustls feature and CatDesk installs ngrok's
