@@ -7463,6 +7463,7 @@ mod tests {
             names,
             vec![
                 "catdesk_instruction",
+                "load_skill",
                 "read",
                 "search",
                 "outline",
@@ -7508,6 +7509,7 @@ mod tests {
             names,
             vec![
                 "catdesk_instruction",
+                "load_skill",
                 "read",
                 "search",
                 "outline",
