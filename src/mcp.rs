@@ -8462,10 +8462,14 @@ mod tests {
             .expect("skill result");
         assert_eq!(result.get("success").and_then(Value::as_bool), Some(true));
         assert_eq!(result.get("skillName").and_then(Value::as_str), Some("rea"));
-        assert!(result
-            .get("skillText")
-            .and_then(Value::as_str)
-            .is_some_and(|skill| skill.contains("ericpq/rea") && skill.contains("rea --version")));
+        assert!(
+            result
+                .get("skillText")
+                .and_then(Value::as_str)
+                .is_some_and(
+                    |skill| skill.contains("ericpq/rea") && skill.contains("rea --version")
+                )
+        );
 
         let bad = tool_call_request("load_skill", json!({ "name": "unknown" }));
         let response = handle_load_skill(&bad);
