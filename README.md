@@ -54,6 +54,12 @@ That's the idea behind CatDesk! It gives ChatGPT Web tools like `write` and `run
 >
 > There have been some signs recently. For example, the reasoning time for GPT-5.6 Sol High has been reduced from 102 mins → 25 mins, and GPT-6 Sol/Astra are not being added to Chat mode for Plus users (at least for now). I believe this kind of project will not last long (maybe until the end of 2026?), but I'll try my best to maintain CatDesk in the meantime.
 
+## Optional REA reverse-engineering skill
+
+CatDesk can load a small, **on-demand** REA skill from the user's [REA fork](https://github.com/ericpq/rea). Invoke `load_skill` with `{"name":"rea"}` for authorized APK, binary, Electron or other shipped-artifact investigations. Ordinary source-only reviews should use CatDesk's normal tools.
+
+This feature adds **no always-on REA MCP tool catalog** and does not install or launch REA. Executing an investigation requires an independently provisioned REA CLI and any target-specific analysis engine. See [REA integration and rollout](docs/REA_INTEGRATION.md).
+
 # How does this work?
 
 1. A ChatGPT Plus or above subscription is required.
