@@ -35,6 +35,13 @@ const LOCAL_TOOLS: &[ToolPolicy] = &[
         verify: "none",
     },
     ToolPolicy {
+        name: "load_skill",
+        category: "agent",
+        access: AccessLevel::Read,
+        retry: "never",
+        verify: "none",
+    },
+    ToolPolicy {
         name: "agent_status",
         category: "agent",
         access: AccessLevel::Read,

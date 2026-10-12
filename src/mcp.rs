@@ -63,6 +63,8 @@ const CATDESK_INSTRUCTION_REQUIRED_MESSAGE: &str =
     "Call catdesk_instruction successfully before using any other CatDesk tool.";
 const CATDESK_INSTRUCTION_REQUIRED_WIDGET_MESSAGE: &str = "ChatGPT didn’t call catdesk_instruction. CatDesk is asking it to call it now. You can ignore this message. It will retry automatically.";
 const CATDESK_INSTRUCTION_REQUIRED_CODE: &str = "CATDESK_INSTRUCTION_REQUIRED";
+/// Optional skill guidance is compiled into CatDesk and never starts REA on its own.
+const REA_SKILL_TEXT: &str = include_str!("../skills/rea/SKILL.md");
 
 fn root_command_enabled() -> bool {
     #[cfg(unix)]
@@ -501,6 +503,10 @@ fn local_tool_output_schema(name: &str) -> Option<Value> {
     match name {
         "catdesk_instruction" => {
             properties.insert("instructionText".to_string(), json!({ "type": "string" }));
+        }
+        "load_skill" => {
+            properties.insert("skillName".to_string(), json!({ "type": "string" }));
+            properties.insert("skillText".to_string(), json!({ "type": "string" }));
         }
         "read" => {
             properties.insert(
@@ -1000,6 +1006,22 @@ fn catdesk_instruction_tool_descriptor() -> Value {
     })
 }
 
+fn load_skill_tool_descriptor() -> Value {
+    json!({
+        "name": "load_skill",
+        "title": "Load optional skill",
+        "description": "Load opt-in instructions for specialized workflows. Use name=rea only when the user asks for analysis of a binary, APK, Electron app, or other shipped artifact. Does not install packages or start a REA server.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "name": { "type": "string", "enum": ["rea"], "description": "Optional skill to load on demand" }
+            },
+            "required": ["name"]
+        },
+        "annotations": { "readOnlyHint": true, "openWorldHint": false, "destructiveHint": false }
+    })
+}
+
 fn create_handoff_tool_descriptor() -> Value {
     json!({
         "name": "create_handoff",
@@ -1208,6 +1230,7 @@ async fn handle_tools_list_with_show_detail_mode(
         }
 
         tools.push(catdesk_instruction_tool_descriptor());
+        tools.push(load_skill_tool_descriptor());
         tools.push(json!({
             "name": "read",
             "title": "Read files",
@@ -1716,6 +1739,7 @@ async fn handle_tools_call_with_show_detail_mode(
                 }
             } else {
                 match tool_name.as_str() {
+                    "load_skill" => handle_load_skill(req),
                     "read" => handle_read_files(req, workspace_root),
                     "search" => handle_search_text(req, workspace_root),
                     "outline" => handle_outline(req, workspace_root),
@@ -4139,6 +4163,23 @@ fn tool_response(
     JsonRpcResponse::success(req.id.clone(), result)
 }
 
+fn handle_load_skill(req: &JsonRpcRequest) -> JsonRpcResponse {
+    match tool_arguments(req).get("name").and_then(Value::as_str) {
+        Some("rea") => tool_success_response_with_structured(
+            req,
+            "Loaded REA guidance on demand; this does not install or launch REA.".to_string(),
+            json!({
+                "toolName": "load_skill",
+                "message": "Loaded REA guidance on demand; this does not install or launch REA.",
+                "success": true,
+                "skillName": "rea",
+                "skillText": REA_SKILL_TEXT
+            }),
+        ),
+        _ => tool_error_response(req, "Unknown skill; supported skill: rea".to_string()),
+    }
+}
+
 fn tool_message_structured(req: &JsonRpcRequest, message: String, is_error: bool) -> Value {
     json!({
         "toolName": tool_name_from_request(req),
@@ -4469,6 +4510,10 @@ Always specify the branch explicitly when using `git push`."#
     );
 
     if mode.computer_enabled() {
+        lines.push(
+            "Optional REA reverse-engineering skill: only for an authorized shipped artifact (binary, APK, Electron app or runtime evidence), call load_skill with name=rea and follow the returned skillText. Ordinary source review uses the built-in tools. Loading a skill never installs, registers or starts REA."
+                .to_string(),
+        );
         lines.push("Use read to read files and search to search the workspace. Name every file you need in one read call.".to_string());
         if handoff_enabled {
             let handoff_search_prefix =
@@ -7023,6 +7068,7 @@ mod tests {
             "run_checks",
             "parse_checks",
             "catdesk_instruction",
+            "load_skill",
             "read",
             "search",
             "outline",
@@ -7417,6 +7463,7 @@ mod tests {
             names,
             vec![
                 "catdesk_instruction",
+                "load_skill",
                 "read",
                 "search",
                 "outline",
@@ -7462,6 +7509,7 @@ mod tests {
             names,
             vec![
                 "catdesk_instruction",
+                "load_skill",
                 "read",
                 "search",
                 "outline",
@@ -8403,6 +8451,38 @@ mod tests {
         assert!(instruction.contains("use create_handoff"));
 
         let _ = std::fs::remove_dir_all(workspace_root);
+    }
+
+    #[test]
+    fn optional_rea_skill_is_embedded_and_requires_an_explicit_name() {
+        let good = tool_call_request("load_skill", json!({ "name": "rea" }));
+        let response = handle_load_skill(&good);
+        let result = response
+            .result
+            .as_ref()
+            .and_then(|result| result.get("structuredContent"))
+            .expect("skill result");
+        assert_eq!(result.get("success").and_then(Value::as_bool), Some(true));
+        assert_eq!(result.get("skillName").and_then(Value::as_str), Some("rea"));
+        assert!(
+            result
+                .get("skillText")
+                .and_then(Value::as_str)
+                .is_some_and(
+                    |skill| skill.contains("ericpq/rea") && skill.contains("rea --version")
+                )
+        );
+
+        let bad = tool_call_request("load_skill", json!({ "name": "unknown" }));
+        let response = handle_load_skill(&bad);
+        assert_eq!(
+            response
+                .result
+                .as_ref()
+                .and_then(|result| result.get("isError"))
+                .and_then(Value::as_bool),
+            Some(true)
+        );
     }
 
     #[test]
