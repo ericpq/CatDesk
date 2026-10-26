@@ -1,0 +1,162 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <style>
+    :root{color-scheme:dark;--bg:#2b2b2b;--line:rgba(255,255,255,.10);--text:#f2f2f2;--muted:#aaa;--ok:#43c97a;--wait:#f1aa5b;--bad:#ff8583;--idle:#8b8b8b}
+    *{box-sizing:border-box}
+    body{margin:0;background:transparent;color:var(--text);font:12px/1.4 system-ui,-apple-system,"Segoe UI",sans-serif}
+    .card{display:grid;grid-template-columns:auto minmax(0,1fr) auto;gap:9px;align-items:center;padding:9px 11px;border:1px solid var(--line);border-radius:10px;background:var(--bg);min-height:54px}
+    .lamp{width:8px;height:8px;border-radius:50%;background:var(--idle)}
+    .lamp.active{background:var(--ok)} .lamp.waiting{background:var(--wait)} .lamp.failed{background:var(--bad)} .lamp.done{background:var(--ok)}
+    .copy{min-width:0}
+    .top{display:flex;align-items:baseline;gap:7px;min-width:0}
+    .brand{font-weight:650;white-space:nowrap}.status{color:var(--muted);white-space:nowrap}
+    .line{margin-top:2px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+    .meta{color:var(--muted);font-variant-numeric:tabular-nums;white-space:nowrap;text-align:right}
+  </style>
+</head>
+<body>
+  <div class="card">
+    <span id="lamp" class="lamp"></span>
+    <div class="copy">
+      <div class="top"><span class="brand">CatDesk</span><span id="status" class="status">连接中</span></div>
+      <div id="line" class="line">正在读取执行状态…</div>
+    </div>
+    <div id="meta" class="meta"></div>
+  </div>
+<script>
+(function(){
+  "use strict";
+  var KEY="catdesk/widgetPayload", payload=null, activity=null, source=null, tick=null, receivedAt=0, lastAction=null, holdUntil=0, holdTimer=null, doneUntil=0, doneTimer=null;
+
+  function getMeta(){return window.openai && window.openai.toolResponseMetadata || null}
+  function readPayload(meta){
+    var p=meta && typeof meta==="object" ? meta[KEY] : null;
+    return p && typeof p==="object" && p.schema==="catdesk.review.v1" ? p : null;
+  }
+  function agent(){return payload && payload.agentState && typeof payload.agentState==="object" ? payload.agentState : {}}
+  function isNoiseTool(tool){
+    tool=String(tool||"");
+    return tool==="agent_status"||tool==="catdesk_instruction";
+  }
+  function liveRunning(){
+    var a=activity&&typeof activity==="object"?activity:{};
+    if(!Array.isArray(a.running))return null;
+    for(var i=a.running.length-1;i>=0;i--){
+      var r=a.running[i];
+      if(r&&!isNoiseTool(r.tool))return r;
+    }
+    return null;
+  }
+  function running(){
+    var r=liveRunning();
+    if(r){
+      lastAction={tool:r.tool,detail:r.detail,elapsedMs:r.elapsedMs};
+      holdUntil=Date.now()+900;
+      if(holdTimer){clearTimeout(holdTimer);holdTimer=null}
+      return r;
+    }
+    if(lastAction&&Date.now()<holdUntil){
+      if(!holdTimer){
+        holdTimer=setTimeout(function(){holdTimer=null;lastAction=null;render()},Math.max(20,holdUntil-Date.now()+20));
+      }
+      return lastAction;
+    }
+    lastAction=null;
+    return null;
+  }
+  function statusInfo(){
+    var r=running(), s=String(agent().status||"");
+    if(r)return {key:"active",text:actionLabel(r.tool)};
+    if(Date.now()<doneUntil)return {key:"done",text:"已完成"};
+    if(s==="failed"||s==="blocked")return {key:"failed",text:s==="blocked"?"受阻":"失败"};
+    if(s==="waiting")return {key:"waiting",text:"等待"};
+    return {key:"",text:"空闲"};
+  }
+  function elapsedText(r){
+    if(!r)return "";
+    var base=Number(r.elapsedMs)||0;
+    var ms=base+(receivedAt?Date.now()-receivedAt:0);
+    var sec=Math.max(0,Math.floor(ms/1000));
+    if(sec<60)return sec+"s";
+    return Math.floor(sec/60)+"m "+(sec%60)+"s";
+  }
+  function actionLabel(tool){
+    tool=String(tool||"");
+    if(tool==="iyunzhi_bi_query")return "查询 BI 数据";
+    if(tool==="read"||tool==="read_symbol")return "读取文件";
+    if(tool==="search"||tool==="find_symbol"||tool==="outline")return "搜索文件";
+    if(tool==="write"||tool==="edit"||tool==="apply_patch"||tool==="delete")return "修改文件";
+    if(tool==="run_checks"||tool==="parse_checks")return "验证结果";
+    if(tool==="run_command"||tool==="start_command"||tool==="poll_command"||tool==="root_command")return "执行命令";
+    if(tool.indexOf("git_")===0)return "处理代码版本";
+    if(tool==="agent_status")return "检查任务状态";
+    if(tool.indexOf("agent_")===0)return "更新任务进度";
+    if(tool==="pavo_image_to_video")return "生成视频";
+    if(tool==="qiurui_game_tasks")return "处理游戏任务";
+    if(tool==="catdesk_instruction")return "读取运行规则";
+    return "调用工具";
+  }
+  function currentLine(){
+    var r=running();
+    if(r)return "当前动作："+actionLabel(r.tool);
+    var s=String(agent().status||"");
+    if(Date.now()<doneUntil)return "当前动作：已完成";
+    if(s==="failed")return "当前动作：已停止";
+    if(s==="blocked")return "当前动作：等待处理";
+    if(s==="waiting")return "当前动作：等待下一步";
+    return "当前动作：无";
+  }
+  function render(){
+    var info=statusInfo(), lamp=document.getElementById("lamp"), st=document.getElementById("status");
+    lamp.className="lamp"+(info.key?" "+info.key:"");
+    st.textContent=info.text;
+    document.getElementById("line").textContent=currentLine();
+    var bits=[], r=running();
+    if(r)bits.push(elapsedText(r));
+    document.getElementById("meta").textContent=bits.join(" · ");
+  }
+  function connect(){
+    if(source){source.close();source=null}
+    var url=payload&&payload.activityStreamUrl;
+    if(!url||typeof EventSource==="undefined")return;
+    try{
+      source=new EventSource(url);
+      source.onmessage=function(e){
+        try{
+          var before=liveRunning(), next=JSON.parse(e.data);
+          activity=next; receivedAt=Date.now();
+          var after=liveRunning();
+          if(after){doneUntil=0;if(doneTimer){clearTimeout(doneTimer);doneTimer=null}}
+          else if(before){
+            doneUntil=Date.now()+3000;
+            if(doneTimer)clearTimeout(doneTimer);
+            doneTimer=setTimeout(function(){doneTimer=null;doneUntil=0;render()},3050);
+          }
+          render();
+        }catch(_){}
+      };
+      source.onerror=function(){};
+    }catch(_){}
+  }
+  function apply(meta){
+    var p=readPayload(meta); if(!p)return;
+    payload=p; activity=p.activity||activity; receivedAt=Date.now(); render(); connect();
+  }
+  window.addEventListener("message",function(e){
+    if(e.source!==window.parent)return;
+    if(e.data&&e.data.method==="ui/notifications/tool-result")apply(getMeta());
+  });
+  window.addEventListener("openai:set_globals",function(e){
+    var g=e&&e.detail&&e.detail.globals;
+    apply(g&&g.toolResponseMetadata||getMeta());
+  },{passive:true});
+  tick=setInterval(function(){if(running())render()},2000);
+  apply(getMeta());
+  render();
+})();
+</script>
+</body>
+</html>

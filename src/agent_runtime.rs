@@ -21,6 +21,8 @@ const MAX_PLAN_STEP_CHARS: usize = 240;
 pub const MAX_RECOVERY_ATTEMPTS: u8 = 2;
 
 static AUDIT_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+// ponytail: one service process; use a file lock if multiple writers share a workspace.
+static STATE_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(default)]
@@ -121,7 +123,19 @@ fn save_state(workspace_root: &Path, mut state: AgentState) -> Result<AgentState
     let temp = path.with_extension("json.tmp");
     let bytes = serde_json::to_vec_pretty(&state)
         .map_err(|error| format!("serialize agent state: {error}"))?;
-    fs::write(&temp, bytes).map_err(|error| format!("write agent state: {error}"))?;
+    let mut options = OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(&temp)
+        .map_err(|error| format!("open agent state: {error}"))?;
+    file.write_all(&bytes)
+        .map_err(|error| format!("write agent state: {error}"))?;
+    drop(file);
     fs::rename(&temp, &path).map_err(|error| format!("replace agent state: {error}"))?;
 
     #[cfg(unix)]
@@ -144,6 +158,9 @@ pub fn load_state(workspace_root: &Path) -> Result<AgentState, String> {
 }
 
 pub fn update_state(workspace_root: &Path, update: AgentUpdate) -> Result<AgentState, String> {
+    let _guard = STATE_LOCK
+        .lock()
+        .map_err(|_| "agent state lock is poisoned".to_string())?;
     let mut state = load_state(workspace_root)?;
 
     if let Some(goal) = update.goal {
@@ -192,6 +209,9 @@ pub fn update_state(workspace_root: &Path, update: AgentUpdate) -> Result<AgentS
 }
 
 pub fn update_plan(workspace_root: &Path, update: PlanUpdate) -> Result<AgentState, String> {
+    let _guard = STATE_LOCK
+        .lock()
+        .map_err(|_| "agent state lock is poisoned".to_string())?;
     let mut state = load_state(workspace_root)?;
 
     if update.clear {
@@ -248,7 +268,11 @@ pub fn note_tool_outcome(
     tool: &str,
     verify_policy: &str,
     ok: bool,
+    failure_reason: Option<&str>,
 ) -> Result<(), String> {
+    let _guard = STATE_LOCK
+        .lock()
+        .map_err(|_| "agent state lock is poisoned".to_string())?;
     let mut state = load_state(workspace_root)?;
     if state.goal.is_empty() || matches!(state.status.as_str(), "done" | "failed") {
         return Ok(());
@@ -261,7 +285,12 @@ pub fn note_tool_outcome(
         ) {
             state.recovery.status = "needed".to_string();
             state.recovery.last_target = tool.to_string();
-            state.recovery.last_error = "tool_failed".to_string();
+            state.recovery.last_error = failure_reason
+                .unwrap_or("tool_failed")
+                .trim()
+                .chars()
+                .take(MAX_NOTE_CHARS)
+                .collect();
             save_state(workspace_root, state)?;
         }
         return Ok(());
@@ -277,14 +306,7 @@ pub fn note_tool_outcome(
 
     if state.status == "verifying"
         && state.verification_pending
-        && !matches!(
-            tool,
-            "catdesk_instruction"
-                | "agent_status"
-                | "agent_checkpoint"
-                | "agent_plan"
-                | "agent_recover"
-        )
+        && matches!(tool, "run_checks" | "parse_checks")
     {
         state.verification_pending = false;
         state.verification_tool.clear();
@@ -300,6 +322,9 @@ pub fn start_recovery(
     action: &str,
     target: &str,
 ) -> Result<AgentState, String> {
+    let _guard = STATE_LOCK
+        .lock()
+        .map_err(|_| "agent state lock is poisoned".to_string())?;
     let mut state = load_state(workspace_root)?;
     if state.goal.is_empty() {
         return Err("no active agent task to recover".into());
@@ -334,6 +359,9 @@ pub fn finish_recovery(
     resume_task: bool,
     error_code: Option<&str>,
 ) -> Result<AgentState, String> {
+    let _guard = STATE_LOCK
+        .lock()
+        .map_err(|_| "agent state lock is poisoned".to_string())?;
     let mut state = load_state(workspace_root)?;
     if success {
         state.recovery.status = "recovered".to_string();
@@ -358,6 +386,9 @@ pub fn finish_recovery(
 }
 
 pub fn block_recovery(workspace_root: &Path, error_code: &str) -> Result<AgentState, String> {
+    let _guard = STATE_LOCK
+        .lock()
+        .map_err(|_| "agent state lock is poisoned".to_string())?;
     let mut state = load_state(workspace_root)?;
     state.recovery.status = "blocked".to_string();
     state.recovery.last_error = bounded(error_code.to_string(), 120, "recovery error")?;
@@ -486,6 +517,87 @@ mod tests {
         ));
         fs::create_dir_all(&path).unwrap();
         path
+    }
+
+    #[test]
+    fn concurrent_updates_preserve_both_fields() {
+        let root = test_root("concurrent");
+        update_state(
+            &root,
+            AgentUpdate {
+                goal: Some("concurrent task".into()),
+                status: Some("active".into()),
+                ..AgentUpdate::default()
+            },
+        )
+        .unwrap();
+        for round in 0..16 {
+            let barrier = std::sync::Barrier::new(2);
+            std::thread::scope(|scope| {
+                scope.spawn(|| {
+                    barrier.wait();
+                    update_state(
+                        &root,
+                        AgentUpdate {
+                            phase: Some(format!("phase-{round}")),
+                            ..AgentUpdate::default()
+                        },
+                    )
+                    .unwrap();
+                });
+                scope.spawn(|| {
+                    barrier.wait();
+                    update_plan(
+                        &root,
+                        PlanUpdate {
+                            steps: Some(vec![format!("step-{round}")]),
+                            ..PlanUpdate::default()
+                        },
+                    )
+                    .unwrap();
+                });
+            });
+            let state = load_state(&root).unwrap();
+            assert_eq!(state.phase, format!("phase-{round}"));
+            assert_eq!(state.plan[0].title, format!("step-{round}"));
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn verification_requires_a_successful_check_verdict() {
+        let root = test_root("check-verdict");
+        update_state(
+            &root,
+            AgentUpdate {
+                goal: Some("verify a change".into()),
+                status: Some("verifying".into()),
+                ..AgentUpdate::default()
+            },
+        )
+        .unwrap();
+        note_tool_outcome(&root, "write", "observable_state", true, None).unwrap();
+        for tool in [
+            "read",
+            "search",
+            "checkpoint_list",
+            "git_log",
+            "start_command",
+            "poll_command",
+            "cancel_command",
+            "run_command",
+        ] {
+            note_tool_outcome(&root, tool, "result", true, None).unwrap();
+            assert!(
+                load_state(&root).unwrap().verification_pending,
+                "{tool} cleared verification"
+            );
+        }
+        note_tool_outcome(&root, "run_checks", "result", false, Some("tests failed")).unwrap();
+        assert!(load_state(&root).unwrap().verification_pending);
+        note_tool_outcome(&root, "parse_checks", "none", true, None).unwrap();
+        assert!(!load_state(&root).unwrap().verification_pending);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -625,7 +737,7 @@ mod tests {
         )
         .unwrap();
 
-        note_tool_outcome(&root, "write", "observable_state", true).unwrap();
+        note_tool_outcome(&root, "write", "observable_state", true, None).unwrap();
         assert!(load_state(&root).unwrap().verification_pending);
 
         let step_error = update_plan(
@@ -657,7 +769,7 @@ mod tests {
             },
         )
         .unwrap();
-        note_tool_outcome(&root, "read", "none", true).unwrap();
+        note_tool_outcome(&root, "run_checks", "result", true, None).unwrap();
 
         let verified = load_state(&root).unwrap();
         assert!(!verified.verification_pending);
@@ -721,7 +833,7 @@ mod tests {
     }
 
     #[test]
-    fn tool_failure_marks_recovery_needed_without_leaking_error_details() {
+    fn tool_failure_persists_replan_context() {
         let root = test_root("recovery-needed");
         update_state(
             &root,
@@ -733,11 +845,21 @@ mod tests {
         )
         .unwrap();
 
-        note_tool_outcome(&root, "read", "none", false).unwrap();
+        note_tool_outcome(
+            &root,
+            "read",
+            "none",
+            false,
+            Some("permission denied while reading durable context"),
+        )
+        .unwrap();
         let state = load_state(&root).unwrap();
         assert_eq!(state.recovery.status, "needed");
         assert_eq!(state.recovery.last_target, "read");
-        assert_eq!(state.recovery.last_error, "tool_failed");
+        assert_eq!(
+            state.recovery.last_error,
+            "permission denied while reading durable context"
+        );
 
         fs::remove_dir_all(root).unwrap();
     }

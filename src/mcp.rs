@@ -18,10 +18,14 @@ use crate::command_jobs::{
     CommandJobManager, CommandJobSnapshot, CommandJobState, DEFAULT_JOB_TIMEOUT_MS,
     DEFAULT_POLL_WAIT_MS, MAX_JOB_TIMEOUT_MS, MAX_POLL_WAIT_MS,
 };
+use crate::desktop_node;
 use crate::devtools::DevtoolsBridge;
+use crate::github_repo;
 use crate::iyunzhi;
 use crate::mascot;
 use crate::outline;
+use crate::pavo;
+use crate::qiurui_game;
 use crate::state::{
     AgentsPathMode, Mode, ShowDetailMode, TokenStatsLayout, ToolMode, app_config_path,
     load_app_config, user_home_dir,
@@ -44,9 +48,12 @@ pub(crate) const MODERN_MCP_PROTOCOL_VERSION: &str = "2026-07-28";
 const SERVER_INFO_META_KEY: &str = "io.modelcontextprotocol/serverInfo";
 const UI_TEMPLATE_URI: &str = "ui://widget/catdesk-dashboard.html";
 const WIDGET_RESOURCE_REVISION: u32 = 3;
+const STATUS_TEMPLATE_URI: &str = "ui://widget/catdesk-status-v6.html";
+const STATUS_WIDGET_RESOURCE_REVISION: u32 = 6;
 const UI_TEMPLATE_MIME_TYPE: &str = "text/html;profile=mcp-app";
 pub(crate) const WIDGET_PAYLOAD_META_KEY: &str = "catdesk/widgetPayload";
 const CATDESK_WIDGET_HTML: &str = include_str!("widget/catdesk_dashboard.html");
+const CATDESK_STATUS_WIDGET_HTML: &str = include_str!("widget/status_card.html");
 const REENABLE_WIDGET_PNG: &[u8] = include_bytes!("widget/assets/reenable_widget.png");
 const REFRESH_CATDESK_PNG: &[u8] = include_bytes!("widget/assets/refresh_catdesk.png");
 const REMOVE_CATDESK_PNG: &[u8] = include_bytes!("widget/assets/remove_catdesk.png");
@@ -59,10 +66,12 @@ const INITIAL_TOKEN_STATS_LAYOUT_PLACEHOLDER: &str =
 const INITIAL_TOOL_NAME_PLACEHOLDER: &str = "__catdeskInitialToolNamePlaceholder__";
 const INITIAL_MASCOT_OUTLINE_PLACEHOLDER: &str = "__catdeskInitialMascotOutlinePlaceholder__";
 const MAX_COMMAND_OUTPUT_CHARS: usize = 24_000;
+const RUN_COMMAND_SYNC_WINDOW_MS: u64 = 8_000;
 const CATDESK_INSTRUCTION_REQUIRED_MESSAGE: &str =
     "Call catdesk_instruction successfully before using any other CatDesk tool.";
 const CATDESK_INSTRUCTION_REQUIRED_WIDGET_MESSAGE: &str = "ChatGPT didn’t call catdesk_instruction. CatDesk is asking it to call it now. You can ignore this message. It will retry automatically.";
 const CATDESK_INSTRUCTION_REQUIRED_CODE: &str = "CATDESK_INSTRUCTION_REQUIRED";
+const REA_SKILL_TEXT: &str = include_str!("../skills/rea/SKILL.md");
 
 fn root_command_enabled() -> bool {
     #[cfg(unix)]
@@ -341,15 +350,27 @@ fn handle_resources_list_with_show_detail_mode(
     }
 
     let ui_meta = widget_resource_ui_meta(public_base_url);
-    let resource_uri = current_widget_resource_uri();
+    let (resource_uri, name, description) = if show_detail_mode == ShowDetailMode::Collapsed {
+        (
+            current_status_widget_resource_uri(),
+            "CatDesk status widget",
+            "Lightweight live status card for CatDesk activity.",
+        )
+    } else {
+        (
+            current_widget_resource_uri(),
+            "CatDesk dashboard widget",
+            "Embedded ChatGPT widget for CatDesk status and timeline data.",
+        )
+    };
     JsonRpcResponse::success(
         req.id.clone(),
         json!({
             "resources": [
                 {
                     "uri": resource_uri,
-                    "name": "CatDesk dashboard widget",
-                    "description": "Embedded ChatGPT widget for CatDesk status and timeline data.",
+                    "name": name,
+                    "description": description,
                     "mimeType": UI_TEMPLATE_MIME_TYPE,
                     "_meta": { "ui": ui_meta }
                 }
@@ -363,8 +384,21 @@ fn current_widget_resource_uri() -> String {
     current_widget_resource_uri_for_tool("")
 }
 
+fn current_status_widget_resource_uri() -> String {
+    format!(
+        "{STATUS_TEMPLATE_URI}?widgetRevision={STATUS_WIDGET_RESOURCE_REVISION}&toolName=agent_status"
+    )
+}
+
 pub(crate) fn is_catdesk_widget_resource_uri(uri: &str) -> bool {
     uri == UI_TEMPLATE_URI || uri.starts_with(&format!("{UI_TEMPLATE_URI}?"))
+}
+
+fn is_catdesk_status_widget_resource_uri(uri: &str) -> bool {
+    uri == STATUS_TEMPLATE_URI
+        || uri.starts_with(&format!("{STATUS_TEMPLATE_URI}?"))
+        || uri == "ui://widget/catdesk-status.html"
+        || uri.starts_with("ui://widget/catdesk-status.html?")
 }
 
 fn current_widget_resource_uri_for_tool(tool_name: &str) -> String {
@@ -458,7 +492,9 @@ fn handle_resources_read_with_show_detail_mode(
     if show_detail_mode == ShowDetailMode::Disable {
         return JsonRpcResponse::error(req.id.clone(), -32602, format!("Unknown resource: {uri}"));
     }
-    let text = if is_catdesk_widget_resource_uri(uri) {
+    let text = if is_catdesk_status_widget_resource_uri(uri) {
+        CATDESK_STATUS_WIDGET_HTML.to_string()
+    } else if is_catdesk_widget_resource_uri(uri) {
         render_widget_html(uri, mascot_seed)
     } else {
         return JsonRpcResponse::error(req.id.clone(), -32602, format!("Unknown resource: {uri}"));
@@ -490,6 +526,10 @@ fn local_tool_output_schema(name: &str) -> Option<Value> {
     match name {
         "catdesk_instruction" => {
             properties.insert("instructionText".to_string(), json!({ "type": "string" }));
+        }
+        "load_skill" => {
+            properties.insert("skillName".to_string(), json!({ "type": "string" }));
+            properties.insert("skillText".to_string(), json!({ "type": "string" }));
         }
         "read" => {
             properties.insert(
@@ -719,6 +759,35 @@ fn local_tool_output_schema(name: &str) -> Option<Value> {
             ] {
                 properties.insert(field.to_string(), json!({ "type": "boolean" }));
             }
+            if name == "run_command" {
+                properties.insert("jobId".to_string(), json!({ "type": "string" }));
+                properties.insert("state".to_string(), json!({ "type": "string" }));
+                properties.insert(
+                    "nextCursor".to_string(),
+                    json!({ "type": "integer", "minimum": 0 }),
+                );
+                properties.insert("hasMoreOutput".to_string(), json!({ "type": "boolean" }));
+                properties.insert("outputTruncated".to_string(), json!({ "type": "boolean" }));
+                properties.insert(
+                    "commandSuccess".to_string(),
+                    json!({ "type": ["boolean", "null"] }),
+                );
+                properties.insert(
+                    "events".to_string(),
+                    json!({
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "seq": { "type": "integer", "minimum": 1 },
+                                "stream": { "type": "string" },
+                                "text": { "type": "string" }
+                            },
+                            "required": ["seq", "stream", "text"]
+                        }
+                    }),
+                );
+            }
             properties.insert(
                 "listEntries".to_string(),
                 json!({
@@ -818,6 +887,63 @@ fn local_tool_output_schema(name: &str) -> Option<Value> {
                 json!({ "type": "array", "items": { "type": "object" } }),
             );
             properties.insert("raw".to_string(), json!({}));
+            properties.insert("error".to_string(), json!({ "type": "string" }));
+        }
+        "desktop_node" => {
+            properties.insert("action".to_string(), json!({ "type": "string" }));
+            properties.insert("result".to_string(), json!({ "type": "object" }));
+            properties.insert("error".to_string(), json!({ "type": "string" }));
+        }
+        "github_repo_read" | "github_repo_write" => {
+            properties.insert("action".to_string(), json!({ "type": "string" }));
+            properties.insert("repo".to_string(), json!({ "type": "string" }));
+            properties.insert("repository".to_string(), json!({ "type": "object" }));
+            properties.insert(
+                "entries".to_string(),
+                json!({ "type": "array", "items": { "type": "object" } }),
+            );
+            properties.insert(
+                "branches".to_string(),
+                json!({ "type": "array", "items": { "type": "object" } }),
+            );
+            properties.insert(
+                "commits".to_string(),
+                json!({ "type": "array", "items": { "type": "object" } }),
+            );
+            properties.insert("content".to_string(), json!({ "type": "string" }));
+            properties.insert("path".to_string(), json!({ "type": "string" }));
+            properties.insert("sha".to_string(), json!({ "type": ["string", "null"] }));
+            properties.insert("branch".to_string(), json!({ "type": "string" }));
+            properties.insert(
+                "commitSha".to_string(),
+                json!({ "type": ["string", "null"] }),
+            );
+            properties.insert(
+                "contentSha".to_string(),
+                json!({ "type": ["string", "null"] }),
+            );
+            properties.insert("number".to_string(), json!({ "type": ["integer", "null"] }));
+            properties.insert("htmlUrl".to_string(), json!({ "type": ["string", "null"] }));
+            properties.insert("error".to_string(), json!({ "type": "string" }));
+        }
+        "pavo_image_to_video" => {
+            for field in ["conversationId", "imageUrl", "videoUrl", "model"] {
+                properties.insert(field.to_string(), json!({ "type": "string" }));
+            }
+            properties.insert(
+                "duration".to_string(),
+                json!({ "type": "integer", "minimum": 1 }),
+            );
+            properties.insert("verified".to_string(), json!({ "type": "boolean" }));
+            properties.insert("error".to_string(), json!({ "type": "string" }));
+        }
+        "qiurui_game_tasks" => {
+            properties.insert("action".to_string(), json!({ "type": "string" }));
+            properties.insert(
+                "tasks".to_string(),
+                json!({ "type": "array", "items": { "type": "object" } }),
+            );
+            properties.insert("task".to_string(), json!({ "type": "object" }));
             properties.insert("error".to_string(), json!({ "type": "string" }));
         }
         "outline" | "read_symbol" => {
@@ -985,6 +1111,22 @@ fn catdesk_instruction_tool_descriptor() -> Value {
     })
 }
 
+fn load_skill_tool_descriptor() -> Value {
+    json!({
+        "name": "load_skill",
+        "title": "Load optional skill",
+        "description": "Load optional REA reverse-engineering workflow guidance when needed; does not install software or start an REA process.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "name": { "type": "string", "enum": ["rea"] }
+            },
+            "required": ["name"]
+        },
+        "annotations": { "readOnlyHint": true, "openWorldHint": false, "destructiveHint": false }
+    })
+}
+
 #[cfg(test)]
 async fn handle_tools_list(
     req: &JsonRpcRequest,
@@ -1017,7 +1159,7 @@ async fn handle_tools_list_with_show_detail_mode(
             tools.push(json!({
                 "name": "run_command",
                 "title": "Run command",
-                "description": "Execute a shell command inside the workspace root. Common directory-listing commands are parsed before execution and may return structured workspace listings instead of raw shell output. Returns stdout and stderr for non-intercepted commands.",
+                "description": "Execute a short shell command inside the workspace root. Common directory-listing commands are parsed before execution and may return structured workspace listings instead of raw shell output. If a non-intercepted command is still running after about 8 seconds, CatDesk keeps it alive as a background job and returns jobId; continue with poll_command. Use start_command directly for work already expected to be long-running.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -1171,7 +1313,68 @@ async fn handle_tools_list_with_show_detail_mode(
             "annotations": { "readOnlyHint": true, "openWorldHint": true, "destructiveHint": false }
         }));
 
+        tools.push(json!({
+            "name": "github_repo_read",
+            "title": "Read GitHub repository",
+            "description": "Read a GitHub repository using credentials already available to CatDesk on the VPS. The token is never accepted as a tool argument or returned. Supports repository metadata, directory contents, UTF-8 text files, branches, and recent commits.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "repo": { "type": "string", "description": "Repository in owner/name form." },
+                    "action": { "type": "string", "enum": ["repo", "contents", "file", "branches", "commits"] },
+                    "path": { "type": "string", "description": "Repository-relative path for contents or file." },
+                    "ref": { "type": "string", "description": "Optional branch, tag, or commit ref." },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 100, "description": "Maximum branches or commits to return; defaults to 20." }
+                },
+                "required": ["repo", "action"]
+            },
+            "annotations": { "readOnlyHint": true, "openWorldHint": true, "destructiveHint": false }
+        }));
+
+        tools.push(json!({
+            "name": "pavo_image_to_video",
+            "title": "Generate PAVO video from image",
+            "description": "Upload a workspace image to PAVO and generate a video. Uses the bearer token stored only in .catdesk/secrets/pavo_token; the token is never accepted as a tool argument or returned. This call may consume PAVO credits.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "conversation_id": { "type": "string", "description": "Existing PAVO conversation ID." },
+                    "image_path": { "type": "string", "description": "Image path inside the CatDesk workspace." },
+                    "prompt": { "type": "string", "description": "Motion prompt for the video." },
+                    "model": { "type": "string", "description": "PAVO model code; defaults to agnes-video-new-flash." },
+                    "ratio": { "type": "string", "description": "Video ratio; defaults to 9:16." },
+                    "duration": { "type": "integer", "minimum": 1, "maximum": 30, "description": "Duration in seconds; defaults to 4." },
+                    "resolution": { "type": "string", "description": "Resolution code; defaults to hd." },
+                    "sound": { "type": "string", "description": "Sound option; defaults to auto." }
+                },
+                "required": ["conversation_id", "image_path", "prompt"]
+            },
+            "annotations": { "readOnlyHint": false, "openWorldHint": true, "destructiveHint": false }
+        }));
+
+        tools.push(json!({
+            "name": "qiurui_game_tasks",
+            "title": "Manage Qiurui Game AI tasks",
+            "description": "List, claim, complete, apply, or fail Qiurui Game AI tasks over HTTPS. Uses the dedicated token stored only in .catdesk/secrets/qiurui_game_token. Advanced tasks complete with result + optional structured changes; apply performs the separately validated state mutation.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": { "type": "string", "enum": ["list", "claim", "complete", "apply", "fail"] },
+                    "task_id": { "type": "string", "description": "Required for claim, complete, apply, and fail." },
+                    "status": { "type": "string", "enum": ["pending", "claimed", "done", "failed"], "description": "Optional list filter." },
+                    "image_path": { "type": "string", "description": "Workspace PNG/JPG/WEBP to upload when completing." },
+                    "image_url": { "type": "string", "description": "HTTPS image URL to store when completing a visual task." },
+                    "result": { "type": "string", "description": "Text result when completing an advanced ChatGPT task." },
+                    "changes": { "type": "object", "description": "Optional allowlisted structured changes proposed by ChatGPT for a later action=apply.", "additionalProperties": true },
+                    "error": { "type": "string", "description": "Failure reason for action=fail." }
+                },
+                "required": ["action"]
+            },
+            "annotations": { "readOnlyHint": false, "openWorldHint": true, "destructiveHint": false }
+        }));
+
         tools.push(catdesk_instruction_tool_descriptor());
+        tools.push(load_skill_tool_descriptor());
         tools.push(json!({
             "name": "read",
             "title": "Read files",
@@ -1322,6 +1525,57 @@ async fn handle_tools_list_with_show_detail_mode(
         }));
 
         if tool_mode.write_tools_enabled() {
+            tools.push(json!({
+                "name": "desktop_node",
+                "title": "Control Desktop Node",
+                "description": "Control the registered CatDesk Desktop Node on the user's Windows PC through the existing outbound Desktop Node channel. Supports status/ping, system/process/window inspection, screenshots, PowerShell, and bounded mouse/keyboard actions.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "action": { "type": "string", "enum": ["status", "ping", "system_info", "processes", "windows", "screenshot", "powershell", "mouse_move", "mouse_click", "mouse_scroll", "mouse_drag", "key", "text"] },
+                        "wait": { "type": "integer", "minimum": 1, "maximum": 300 },
+                        "script": { "type": "string" },
+                        "timeout": { "type": "integer", "minimum": 1, "maximum": 300 },
+                        "x": { "type": "integer" },
+                        "y": { "type": "integer" },
+                        "x1": { "type": "integer" },
+                        "y1": { "type": "integer" },
+                        "x2": { "type": "integer" },
+                        "y2": { "type": "integer" },
+                        "duration_ms": { "type": "integer", "minimum": 80, "maximum": 3000 },
+                        "button": { "type": "string", "enum": ["left", "right", "middle"] },
+                        "clicks": { "type": "integer", "minimum": 1, "maximum": 3 },
+                        "delta": { "type": "integer" },
+                        "combo": { "type": "string" },
+                        "text": { "type": "string" }
+                    },
+                    "required": ["action"]
+                },
+                "annotations": { "readOnlyHint": false, "openWorldHint": false, "destructiveHint": true }
+            }));
+            tools.push(json!({
+                "name": "github_repo_write",
+                "title": "Write GitHub repository",
+                "description": "Make bounded GitHub repository changes using credentials already available to CatDesk. Supports creating a branch, creating or SHA-guarded updating of a UTF-8 text file, and opening a pull request. The token is never accepted or returned.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "repo": { "type": "string", "description": "Repository in owner/name form." },
+                        "action": { "type": "string", "enum": ["create_branch", "create_file", "update_file", "create_pr"] },
+                        "branch": { "type": "string", "description": "Target branch for create_branch/create_file/update_file." },
+                        "base": { "type": "string", "description": "Base branch for create_branch or create_pr." },
+                        "path": { "type": "string", "description": "Repository-relative file path." },
+                        "content": { "type": "string", "description": "Complete UTF-8 text file contents." },
+                        "message": { "type": "string", "description": "Commit message for file create/update." },
+                        "sha": { "type": "string", "description": "Current blob SHA required for update_file to prevent blind overwrite." },
+                        "title": { "type": "string", "description": "Pull request title." },
+                        "head": { "type": "string", "description": "Pull request head branch." },
+                        "body": { "type": "string", "description": "Optional pull request body." }
+                    },
+                    "required": ["repo", "action"]
+                },
+                "annotations": { "readOnlyHint": false, "openWorldHint": true, "destructiveHint": false }
+            }));
             tools.push(json!({
                 "name": "agent_checkpoint",
                 "title": "Update agent checkpoint",
@@ -1583,7 +1837,7 @@ async fn handle_tools_call_with_show_detail_mode(
         capture_checkpoint_for_request(req, &tool_name, workspace_root);
     }
 
-    let change_session = (show_detail_mode != ShowDetailMode::Disable).then(|| {
+    let change_session = (show_detail_mode == ShowDetailMode::Expanded).then(|| {
         ChangeSession::begin(
             Path::new(workspace_root),
             change_scope_for_request(req, workspace_root),
@@ -1626,7 +1880,14 @@ async fn handle_tools_call_with_show_detail_mode(
                 if tool_mode.run_command_enabled() {
                     match tool_name.as_str() {
                         "run_command" => {
-                            handle_run_command(req, workspace_root, set_catdesk_as_co_author).await
+                            handle_run_command(
+                                req,
+                                workspace_root,
+                                set_catdesk_as_co_author,
+                                command_jobs,
+                                show_detail_mode,
+                            )
+                            .await
                         }
                         "root_command" => {
                             if root_command_enabled() {
@@ -1658,6 +1919,7 @@ async fn handle_tools_call_with_show_detail_mode(
                 }
             } else {
                 match tool_name.as_str() {
+                    "load_skill" => handle_load_skill(req),
                     "read" => handle_read_files(req, workspace_root),
                     "search" => handle_search_text(req, workspace_root),
                     "outline" => handle_outline(req, workspace_root),
@@ -1669,9 +1931,16 @@ async fn handle_tools_call_with_show_detail_mode(
                     "git_log" => handle_git_log(req, workspace_root).await,
                     "checkpoint_list" => handle_checkpoint_list(req, workspace_root),
                     "iyunzhi_bi_query" => handle_iyunzhi_bi_query(req, workspace_root).await,
+                    "github_repo_read" => handle_github_repo_read(req, workspace_root).await,
+                    "pavo_image_to_video" => handle_pavo_image_to_video(req, workspace_root).await,
+                    "qiurui_game_tasks" => handle_qiurui_game_tasks(req, workspace_root).await,
                     _ => {
                         if tool_mode.write_tools_enabled() {
                             match tool_name.as_str() {
+                                "desktop_node" => handle_desktop_node(req, workspace_root).await,
+                                "github_repo_write" => {
+                                    handle_github_repo_write(req, workspace_root).await
+                                }
                                 "agent_checkpoint" => handle_agent_checkpoint(req, workspace_root),
                                 "agent_plan" => handle_agent_plan(req, workspace_root),
                                 "agent_recover" => handle_agent_recover(req, workspace_root),
@@ -1733,10 +2002,10 @@ async fn handle_tools_call_with_show_detail_mode(
         .as_ref()
         .map(ChangeSession::changes)
         .unwrap_or_default();
-    if show_detail_mode != ShowDetailMode::Disable
+    if show_detail_mode == ShowDetailMode::Expanded
         && matches!(
             tool_name.as_str(),
-            "start_command" | "poll_command" | "cancel_command"
+            "run_command" | "start_command" | "poll_command" | "cancel_command"
         )
     {
         if let Some(job_id) = command_job_id_from_response(&response) {
@@ -1745,20 +2014,11 @@ async fn handle_tools_call_with_show_detail_mode(
             }
         }
     }
-    let is_error = response
-        .result
-        .as_ref()
-        .and_then(|v| v.get("isError"))
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    activity_guard.set_result(!is_error, activity_failure_reason(&response, is_error));
+    let is_error = tool_response_failed(&response);
+    let failure_reason = activity_failure_reason(&response, is_error);
+    activity_guard.set_result(!is_error, failure_reason.clone());
     if let Some(policy) = tool_registry::local_policy(&tool_name) {
-        let _ = agent_runtime::note_tool_outcome(
-            Path::new(workspace_root),
-            &tool_name,
-            policy.verify,
-            !is_error,
-        );
+        response = record_agent_outcome(response, workspace_root, &tool_name, policy.verify);
     }
     let _ = agent_runtime::record_tool_call(
         Path::new(workspace_root),
@@ -1858,13 +2118,12 @@ async fn forward_to_devtools(
         match response {
             Ok(resp) => {
                 if let Some(result) = resp.get("result") {
-                    let _ = agent_runtime::note_tool_outcome(
-                        Path::new(workspace_root),
+                    return record_agent_outcome(
+                        JsonRpcResponse::success(req.id.clone(), result.clone()),
+                        workspace_root,
                         tool_name,
                         verify_policy,
-                        true,
                     );
-                    return JsonRpcResponse::success(req.id.clone(), result.clone());
                 }
                 if let Some(error) = resp.get("error") {
                     let code = error.get("code").and_then(|c| c.as_i64()).unwrap_or(-32000);
@@ -1877,9 +2136,20 @@ async fn forward_to_devtools(
                         tokio::time::sleep(std::time::Duration::from_millis(150)).await;
                         continue;
                     }
-                    return tool_error_response(req, text);
+                    return record_agent_outcome(
+                        tool_error_response(req, text),
+                        workspace_root,
+                        tool_name,
+                        verify_policy,
+                    );
                 }
-                return tool_error_response(req, "DevTools bridge returned empty response".into());
+                let text = "DevTools bridge returned empty response".to_string();
+                return record_agent_outcome(
+                    tool_error_response(req, text),
+                    workspace_root,
+                    tool_name,
+                    verify_policy,
+                );
             }
             Err(error) => {
                 let text = format!("DevTools bridge error: {error}");
@@ -1887,12 +2157,23 @@ async fn forward_to_devtools(
                     tokio::time::sleep(std::time::Duration::from_millis(150)).await;
                     continue;
                 }
-                return tool_error_response(req, text);
+                return record_agent_outcome(
+                    tool_error_response(req, text),
+                    workspace_root,
+                    tool_name,
+                    verify_policy,
+                );
             }
         }
     }
 
-    tool_error_response(req, "DevTools retry exhausted".into())
+    let text = "DevTools retry exhausted".to_string();
+    record_agent_outcome(
+        tool_error_response(req, text),
+        workspace_root,
+        tool_name,
+        verify_policy,
+    )
 }
 
 fn format_command_output_events<'a, I>(events: I) -> String
@@ -2041,7 +2322,7 @@ async fn handle_start_command(
         timeout_ms.hash(&mut hasher);
         format!("start_command:{id}:{:016x}", hasher.finish())
     });
-    let change_session = (show_detail_mode != ShowDetailMode::Disable).then(|| {
+    let change_session = (show_detail_mode == ShowDetailMode::Expanded).then(|| {
         ChangeSession::begin(
             Path::new(workspace_root),
             ChangeScope::single(ChangeTarget::discovered(cwd.clone(), true)),
@@ -2771,12 +3052,60 @@ fn activity_detail(req: &JsonRpcRequest, tool_name: &str) -> Option<String> {
 
 /// The message a failed call came back with, so a red row in the monitor says
 /// why rather than only that.
+fn tool_response_failed(response: &JsonRpcResponse) -> bool {
+    let Some(result) = response.result.as_ref() else {
+        return false;
+    };
+    if result.get("isError").and_then(Value::as_bool) == Some(true) {
+        return true;
+    }
+    result
+        .get("structuredContent")
+        .and_then(|structured| structured.get("success"))
+        .and_then(Value::as_bool)
+        == Some(false)
+}
+
+fn record_agent_outcome(
+    mut response: JsonRpcResponse,
+    workspace_root: &str,
+    tool_name: &str,
+    verify_policy: &str,
+) -> JsonRpcResponse {
+    let failed = tool_response_failed(&response);
+    let reason = activity_failure_reason(&response, failed);
+    if let Err(error) = agent_runtime::note_tool_outcome(
+        Path::new(workspace_root),
+        tool_name,
+        verify_policy,
+        !failed,
+        reason.as_deref(),
+    ) {
+        let warning = format!(
+            "Agent safety state could not be saved: {error}. The tool outcome is unchanged; do not repeat a completed mutation. Repair state storage and verify before marking the task done."
+        );
+        if let Some(result) = response.result.as_mut() {
+            if let Some(structured) = result
+                .get_mut("structuredContent")
+                .and_then(Value::as_object_mut)
+            {
+                structured.insert("agentStateWarning".into(), json!(warning));
+            }
+            if let Some(content) = result.get_mut("content").and_then(Value::as_array_mut) {
+                content.push(json!({ "type": "text", "text": warning }));
+            }
+            result["_meta"]["catdesk/agentStateWarning"] = json!(warning);
+        }
+    }
+    response
+}
+
 fn activity_failure_reason(response: &JsonRpcResponse, is_error: bool) -> Option<String> {
     if !is_error {
         return None;
     }
     let structured = response.result.as_ref()?.get("structuredContent")?;
-    for key in ["message", "stderr", "summary"] {
+    for key in ["message", "error", "stderr", "summary", "outputTail"] {
         if let Some(text) = structured.get(key).and_then(Value::as_str)
             && !text.trim().is_empty()
         {
@@ -3321,6 +3650,208 @@ async fn handle_iyunzhi_bi_query(req: &JsonRpcRequest, workspace_root: &str) -> 
     }
 }
 
+async fn handle_desktop_node(req: &JsonRpcRequest, workspace_root: &str) -> JsonRpcResponse {
+    let arguments = tool_arguments(req);
+    match desktop_node::run(workspace_root, &arguments).await {
+        Ok(mut structured) => {
+            if let Some(obj) = structured.as_object_mut() {
+                obj.insert("toolName".to_string(), json!("desktop_node"));
+                obj.insert("success".to_string(), json!(true));
+            }
+            let text = serde_json::to_string_pretty(&structured)
+                .unwrap_or_else(|_| "Desktop Node action succeeded".to_string());
+            tool_success_response_with_structured(req, text, structured)
+        }
+        Err(error) => tool_error_response_with_structured(
+            req,
+            error.clone(),
+            json!({"toolName": "desktop_node", "success": false, "error": error}),
+        ),
+    }
+}
+
+async fn handle_github_repo_read(req: &JsonRpcRequest, workspace_root: &str) -> JsonRpcResponse {
+    let arguments = tool_arguments(req);
+    match github_repo::read(workspace_root, &arguments).await {
+        Ok(mut structured) => {
+            if let Some(obj) = structured.as_object_mut() {
+                obj.insert("toolName".to_string(), json!("github_repo_read"));
+                obj.insert("success".to_string(), json!(true));
+            }
+            let text = serde_json::to_string_pretty(&structured)
+                .unwrap_or_else(|_| "GitHub repository read succeeded".to_string());
+            tool_success_response_with_structured(req, text, structured)
+        }
+        Err(error) => tool_error_response_with_structured(
+            req,
+            error.clone(),
+            json!({"toolName": "github_repo_read", "success": false, "error": error}),
+        ),
+    }
+}
+
+async fn handle_github_repo_write(req: &JsonRpcRequest, workspace_root: &str) -> JsonRpcResponse {
+    let arguments = tool_arguments(req);
+    match github_repo::write(workspace_root, &arguments).await {
+        Ok(mut structured) => {
+            if let Some(obj) = structured.as_object_mut() {
+                obj.insert("toolName".to_string(), json!("github_repo_write"));
+                obj.insert("success".to_string(), json!(true));
+            }
+            let text = serde_json::to_string_pretty(&structured)
+                .unwrap_or_else(|_| "GitHub repository write succeeded".to_string());
+            tool_success_response_with_structured(req, text, structured)
+        }
+        Err(error) => tool_error_response_with_structured(
+            req,
+            error.clone(),
+            json!({"toolName": "github_repo_write", "success": false, "error": error}),
+        ),
+    }
+}
+
+async fn handle_pavo_image_to_video(req: &JsonRpcRequest, workspace_root: &str) -> JsonRpcResponse {
+    let arguments = tool_arguments(req);
+    let conversation_id = match required_string_argument(&arguments, "conversation_id") {
+        Ok(value) => value.to_string(),
+        Err(error) => return tool_error_response(req, error),
+    };
+    let image_path = match required_string_argument(&arguments, "image_path") {
+        Ok(value) => value.to_string(),
+        Err(error) => return tool_error_response(req, error),
+    };
+    let prompt = match required_string_argument(&arguments, "prompt") {
+        Ok(value) => value.to_string(),
+        Err(error) => return tool_error_response(req, error),
+    };
+    let get_string = |name: &str, default: &str| -> Result<String, String> {
+        Ok(optional_string_argument(&arguments, name)?
+            .unwrap_or(default)
+            .to_string())
+    };
+    let model = match get_string("model", "agnes-video-new-flash") {
+        Ok(value) => value,
+        Err(error) => return tool_error_response(req, error),
+    };
+    let ratio = match get_string("ratio", "9:16") {
+        Ok(value) => value,
+        Err(error) => return tool_error_response(req, error),
+    };
+    let resolution = match get_string("resolution", "hd") {
+        Ok(value) => value,
+        Err(error) => return tool_error_response(req, error),
+    };
+    let sound = match get_string("sound", "auto") {
+        Ok(value) => value,
+        Err(error) => return tool_error_response(req, error),
+    };
+    let duration = match optional_usize_argument(&arguments, "duration") {
+        Ok(Some(value @ 1..=30)) => value as u64,
+        Ok(Some(_)) => {
+            return tool_error_response(req, "duration must be between 1 and 30".into());
+        }
+        Ok(None) => 4,
+        Err(error) => return tool_error_response(req, error),
+    };
+
+    let params = pavo::GenerateParams {
+        conversation_id,
+        image_path,
+        prompt,
+        model,
+        ratio,
+        duration,
+        resolution,
+        sound,
+    };
+
+    match pavo::image_to_video(workspace_root, params).await {
+        Ok(mut structured) => {
+            if let Some(obj) = structured.as_object_mut() {
+                obj.insert("toolName".to_string(), json!("pavo_image_to_video"));
+            }
+            let text = serde_json::to_string_pretty(&structured)
+                .unwrap_or_else(|_| "PAVO video generation succeeded".to_string());
+            tool_success_response_with_structured(req, text, structured)
+        }
+        Err(error) => tool_error_response_with_structured(
+            req,
+            error.clone(),
+            json!({
+                "toolName": "pavo_image_to_video",
+                "success": false,
+                "error": error,
+            }),
+        ),
+    }
+}
+
+async fn handle_qiurui_game_tasks(req: &JsonRpcRequest, workspace_root: &str) -> JsonRpcResponse {
+    let arguments = tool_arguments(req);
+    let action = match required_string_argument(&arguments, "action") {
+        Ok(value) => value.to_string(),
+        Err(error) => return tool_error_response(req, error),
+    };
+    let optional = |name: &str| -> Result<Option<String>, String> {
+        Ok(optional_string_argument(&arguments, name)?.map(str::to_string))
+    };
+    let params = qiurui_game::TaskParams {
+        action: action.clone(),
+        task_id: match optional("task_id") {
+            Ok(value) => value,
+            Err(error) => return tool_error_response(req, error),
+        },
+        status: match optional("status") {
+            Ok(value) => value,
+            Err(error) => return tool_error_response(req, error),
+        },
+        image_path: match optional("image_path") {
+            Ok(value) => value,
+            Err(error) => return tool_error_response(req, error),
+        },
+        image_url: match optional("image_url") {
+            Ok(value) => value,
+            Err(error) => return tool_error_response(req, error),
+        },
+        result: match optional("result") {
+            Ok(value) => value,
+            Err(error) => return tool_error_response(req, error),
+        },
+        changes: match arguments.get("changes") {
+            None => None,
+            Some(value) if value.is_object() => Some(value.clone()),
+            Some(_) => return tool_error_response(req, "changes must be an object".into()),
+        },
+        error: match optional("error") {
+            Ok(value) => value,
+            Err(error) => return tool_error_response(req, error),
+        },
+    };
+
+    match qiurui_game::run(workspace_root, params).await {
+        Ok(mut structured) => {
+            if let Some(obj) = structured.as_object_mut() {
+                obj.insert("toolName".to_string(), json!("qiurui_game_tasks"));
+                obj.insert("success".to_string(), json!(true));
+                obj.insert("action".to_string(), json!(action));
+            }
+            let text = serde_json::to_string_pretty(&structured)
+                .unwrap_or_else(|_| "Qiurui Game task action succeeded".to_string());
+            tool_success_response_with_structured(req, text, structured)
+        }
+        Err(error) => tool_error_response_with_structured(
+            req,
+            error.clone(),
+            json!({
+                "toolName": "qiurui_game_tasks",
+                "success": false,
+                "action": action,
+                "error": error,
+            }),
+        ),
+    }
+}
+
 async fn handle_run_checks(req: &JsonRpcRequest, workspace_root: &str) -> JsonRpcResponse {
     let arguments = tool_arguments(req);
     let cwd = match resolve_git_cwd(&arguments, workspace_root) {
@@ -3684,6 +4215,8 @@ async fn handle_run_command(
     req: &JsonRpcRequest,
     workspace_root: &str,
     set_catdesk_as_co_author: bool,
+    command_jobs: &CommandJobManager,
+    show_detail_mode: ShowDetailMode,
 ) -> JsonRpcResponse {
     let params = &req.params;
     let arguments = params.get("arguments").cloned().unwrap_or(json!({}));
@@ -3782,13 +4315,94 @@ async fn handle_run_command(
         );
     }
 
-    let result = command::run_command(
-        &effective_command,
-        Path::new(workspace_root),
-        &cwd,
-        effective_timeout,
-    )
-    .await;
+    let request_key = req.id.as_ref().map(|id| {
+        let mut hasher = DefaultHasher::new();
+        effective_command.hash(&mut hasher);
+        cwd.hash(&mut hasher);
+        effective_timeout.hash(&mut hasher);
+        format!("run_command:{id}:{:016x}", hasher.finish())
+    });
+    let job_change_session = (show_detail_mode == ShowDetailMode::Expanded).then(|| {
+        ChangeSession::begin(
+            Path::new(workspace_root),
+            ChangeScope::single(ChangeTarget::discovered(cwd.clone(), true)),
+        )
+    });
+    let started = match command_jobs
+        .start_with_change_session(
+            effective_command.clone(),
+            Path::new(workspace_root).to_path_buf(),
+            cwd.clone(),
+            effective_timeout,
+            request_key,
+            job_change_session,
+        )
+        .await
+    {
+        Ok(started) => started,
+        Err(error) => return tool_error_response(req, error),
+    };
+    let job_id = started.snapshot.job_id.clone();
+
+    if started.deduplicated && !started.snapshot.state.is_terminal() {
+        let structured = command_job_structured("run_command", &started.snapshot);
+        return tool_success_response_with_structured(
+            req,
+            format!(
+                "Command is already running as background job {}. Poll it with poll_command.",
+                job_id
+            ),
+            structured,
+        );
+    }
+
+    let started_waiting = std::time::Instant::now();
+    let mut cursor = 0;
+    let snapshot = loop {
+        let elapsed_ms = started_waiting.elapsed().as_millis().min(u64::MAX as u128) as u64;
+        if elapsed_ms >= RUN_COMMAND_SYNC_WINDOW_MS {
+            break match command_jobs.poll(&job_id, 0, 0).await {
+                Ok(snapshot) => snapshot,
+                Err(error) => return tool_error_response(req, error),
+            };
+        }
+        let wait_ms = (RUN_COMMAND_SYNC_WINDOW_MS - elapsed_ms).min(1_000);
+        let current = match command_jobs.poll(&job_id, cursor, wait_ms).await {
+            Ok(snapshot) => snapshot,
+            Err(error) => return tool_error_response(req, error),
+        };
+        cursor = current.next_cursor;
+        if current.state.is_terminal() {
+            break current;
+        }
+    };
+
+    if !snapshot.state.is_terminal() {
+        let structured = command_job_structured("run_command", &snapshot);
+        return tool_success_response_with_structured(
+            req,
+            format!(
+                "Command is still running after {} ms and continues as background job {}. Poll it with poll_command.",
+                RUN_COMMAND_SYNC_WINDOW_MS, job_id
+            ),
+            structured,
+        );
+    }
+
+    let (snapshot, stdout, stderr) = match command_jobs.retained_output(&job_id).await {
+        Ok(output) => output,
+        Err(error) => return tool_error_response(req, error),
+    };
+    let result = command::CommandResult {
+        stdout,
+        stderr,
+        success: snapshot.state == CommandJobState::Succeeded,
+        exit_code: snapshot.exit_code,
+        elapsed_ms: snapshot.elapsed_ms,
+        timed_out: snapshot.state == CommandJobState::TimedOut,
+        stdout_truncated: snapshot.output_truncated,
+        stderr_truncated: snapshot.output_truncated,
+    };
     let output = command::format_result(&result);
     let structured = json!({
         "toolName": "run_command",
@@ -4021,6 +4635,23 @@ fn tool_response(
         }
     }
     JsonRpcResponse::success(req.id.clone(), result)
+}
+
+fn handle_load_skill(req: &JsonRpcRequest) -> JsonRpcResponse {
+    match tool_arguments(req).get("name").and_then(Value::as_str) {
+        Some("rea") => tool_success_response_with_structured(
+            req,
+            "REA guidance loaded; no runtime was started.".to_string(),
+            json!({
+                "toolName": "load_skill",
+                "message": "REA guidance loaded; no runtime was started.",
+                "success": true,
+                "skillName": "rea",
+                "skillText": REA_SKILL_TEXT
+            }),
+        ),
+        _ => tool_error_response(req, "Unknown skill; supported skill: rea".to_string()),
+    }
 }
 
 fn tool_message_structured(req: &JsonRpcRequest, message: String, is_error: bool) -> Value {
@@ -4322,6 +4953,10 @@ Always specify the branch explicitly when using `git push`."#
             .to_string(),
     );
     lines.push(
+        "For non-trivial multi-step work, call agent_status once near the start so ChatGPT can surface CatDesk's lightweight live status card. Do not repeatedly call agent_status just to refresh the card; the card follows activity events itself."
+            .to_string(),
+    );
+    lines.push(
         "Verification contract: never claim success from generated code or a process start alone. Run proportionate tests and check the final observable state. For service changes, require sustained health plus an end-to-end functional probe, and retain a tested rollback path."
             .to_string(),
     );
@@ -4330,7 +4965,7 @@ Always specify the branch explicitly when using `git push`."#
             .to_string(),
     );
     lines.push(
-        "Task lifecycle: use queued/active/waiting/verifying/blocked/done/failed checkpoints when a long task benefits from explicit state. For non-trivial multi-step work, persist a small plan with agent_plan and update step status as work advances. After an observable-state mutation, move to verifying and perform a successful verification action before marking a step or task done."
+        "Task lifecycle: use queued/active/waiting/verifying/blocked/done/failed checkpoints when a long task benefits from explicit state. For non-trivial multi-step work, persist a small plan with agent_plan and update step status as work advances. After an observable-state mutation, move to verifying and perform a successful run_checks or parse_checks verdict before marking a step or task done. Reads and running command jobs do not clear verification debt."
             .to_string(),
     );
     lines.push(
@@ -4347,6 +4982,7 @@ Always specify the branch explicitly when using `git push`."#
     );
 
     if mode.computer_enabled() {
+        lines.push("For authorized shipped binary, APK, or Electron reverse engineering, load the optional REA workflow using load_skill with name=rea; for source-only tasks use the normal CatDesk tools. Loading does not install or execute REA.".to_string());
         lines.push("Use read to read files and search to search the workspace. Name every file you need in one read call.".to_string());
         if tool_mode.run_command_enabled() {
             lines.push(
@@ -4368,7 +5004,7 @@ Always specify the branch explicitly when using `git push`."#
                     .to_string(),
             );
             lines.push(
-                "Use run_checks for short tests, builds and type checks. For anything likely to take more than about 15 seconds, use start_command, poll_command at least every 10 seconds while the user is waiting, and parse_checks after completion. A running poll is a heartbeat even when there is no new stdout/stderr, so do not leave the user wondering whether the task is stuck."
+                "Use run_checks for short tests, builds and type checks. For anything likely to take more than about 8 seconds, use start_command, poll_command at least every 10 seconds while the user is waiting, and parse_checks after completion. run_command also auto-promotes a command that is still running after about 8 seconds into a background job and returns jobId as a safety net. A running poll is a heartbeat even when there is no new stdout/stderr, so do not leave the user wondering whether the task is stuck."
                     .to_string(),
             );
             lines.push(
@@ -4708,6 +5344,16 @@ fn ensure_tool_descriptor_widget_template_with_show_detail_mode(
         return;
     };
     let name = name.to_string();
+    if show_detail_mode == ShowDetailMode::Collapsed {
+        if name != "agent_status" {
+            return;
+        }
+        let meta_value = tool_obj
+            .entry("_meta".to_string())
+            .or_insert_with(|| json!({}));
+        ensure_output_template_meta_with_uri(meta_value, &current_status_widget_resource_uri());
+        return;
+    }
     if !tool_descriptor_should_attach_widget(&name) {
         return;
     }
@@ -5214,6 +5860,34 @@ fn build_generic_widget_payload(
     Value::Object(payload)
 }
 
+fn build_agent_status_widget_payload(result: &Value, is_error: bool) -> Value {
+    let structured = result.get("structuredContent").and_then(Value::as_object);
+    let agent_state = structured
+        .and_then(|value| value.get("state"))
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    let activity = structured
+        .and_then(|value| value.get("activity"))
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    let health = structured
+        .and_then(|value| value.get("health"))
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    let status = agent_state
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or(if is_error { "failed" } else { "active" });
+
+    let mut payload = base_widget_payload("tool_call", "CatDesk", status, Some("agent_status"));
+    payload.insert("agentState".to_string(), agent_state);
+    payload.insert("activity".to_string(), activity);
+    payload.insert("health".to_string(), health);
+    payload.insert("changedFiles".to_string(), json!([]));
+    payload.insert("hasChanges".to_string(), json!(false));
+    Value::Object(payload)
+}
+
 fn build_widget_payload_error(
     req: &JsonRpcRequest,
     widget_context: Option<&AutoWidgetContext>,
@@ -5244,6 +5918,7 @@ fn build_auto_widget_payload(
         .and_then(Value::as_bool)
         .unwrap_or(false);
     match tool_name.as_str() {
+        "agent_status" => build_agent_status_widget_payload(result, is_error),
         "search" => match build_search_text_widget_payload(result, is_error) {
             Some(payload) => payload,
             None if is_error => build_generic_widget_payload(req, result, widget_context, is_error),
@@ -5340,6 +6015,11 @@ fn enrich_tool_result_with_show_detail_mode(
     show_detail_mode: ShowDetailMode,
 ) -> Value {
     if show_detail_mode == ShowDetailMode::Disable {
+        return result;
+    }
+    if show_detail_mode == ShowDetailMode::Collapsed
+        && tool_name_from_request(req) != "agent_status"
+    {
         return result;
     }
 
@@ -5961,12 +6641,29 @@ mod tests {
     }
 
     fn tool_response_is_error(response: &JsonRpcResponse) -> bool {
-        response
-            .result
-            .as_ref()
-            .and_then(|result| result.get("isError"))
-            .and_then(Value::as_bool)
-            .unwrap_or(false)
+        tool_response_failed(response)
+    }
+
+    #[test]
+    fn structured_success_false_counts_as_tool_failure() {
+        let req = tool_call_request("run_checks", json!({}));
+        let response = JsonRpcResponse::success(
+            req.id.clone(),
+            json!({
+                "content": [],
+                "structuredContent": {
+                    "toolName": "run_checks",
+                    "success": false,
+                    "outputTail": "test failed"
+                }
+            }),
+        );
+
+        assert!(tool_response_is_error(&response));
+        assert_eq!(
+            activity_failure_reason(&response, true).as_deref(),
+            Some("test failed")
+        );
     }
 
     fn result_text(response: &JsonRpcResponse) -> &str {
@@ -6527,6 +7224,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn run_command_auto_promotes_long_process_to_background_job() {
+        let workspace_root =
+            std::env::temp_dir().join(format!("catdesk-mcp-run-promote-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&workspace_root).expect("create workspace");
+        let workspace_root_str = workspace_root.to_string_lossy().into_owned();
+        let jobs = CommandJobManager::new();
+        let command = if cfg!(windows) {
+            "Start-Sleep -Seconds 30"
+        } else {
+            "sleep 30"
+        };
+        let req = tool_call_request(
+            "run_command",
+            json!({ "command": command, "timeout": 60_000 }),
+        );
+
+        let started = std::time::Instant::now();
+        let response = handle_tools_call(
+            &req,
+            &workspace_root_str,
+            1,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &jobs,
+            &None,
+        )
+        .await;
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(12),
+            "run_command must return before a long command finishes"
+        );
+
+        let structured = response
+            .result
+            .as_ref()
+            .and_then(|result| result.get("structuredContent"))
+            .expect("missing structured content");
+        assert_eq!(
+            structured.get("state").and_then(Value::as_str),
+            Some("running")
+        );
+        let job_id = structured
+            .get("jobId")
+            .and_then(Value::as_str)
+            .expect("missing promoted job id")
+            .to_string();
+        assert_eq!(
+            structured.get("toolName").and_then(Value::as_str),
+            Some("run_command")
+        );
+
+        let cancelled = jobs.cancel(&job_id).await.expect("cancel promoted job");
+        assert!(cancelled.state.is_terminal());
+        let _ = std::fs::remove_dir_all(workspace_root);
+    }
+
+    #[tokio::test]
     async fn root_command_rejects_relative_cwd() {
         let req = tool_call_request(
             "root_command",
@@ -6569,13 +7324,18 @@ mod tests {
             names,
             vec![
                 "run_command",
+                "root_command",
                 "start_command",
                 "poll_command",
                 "cancel_command",
                 "run_checks",
                 "parse_checks",
                 "iyunzhi_bi_query",
+                "github_repo_read",
+                "pavo_image_to_video",
+                "qiurui_game_tasks",
                 "catdesk_instruction",
+                "load_skill",
                 "read",
                 "search",
                 "outline",
@@ -6586,6 +7346,8 @@ mod tests {
                 "git_log",
                 "agent_status",
                 "checkpoint_list",
+                "desktop_node",
+                "github_repo_write",
                 "agent_checkpoint",
                 "agent_plan",
                 "agent_recover",
@@ -6936,6 +7698,35 @@ mod tests {
         let _ = std::fs::remove_dir_all(workspace_root);
     }
 
+    #[test]
+    fn optional_rea_skill_is_loaded_only_when_requested() {
+        let req = tool_call_request("load_skill", json!({"name":"rea"}));
+        let response = handle_load_skill(&req);
+        let result = response
+            .result
+            .as_ref()
+            .and_then(|r| r.get("structuredContent"))
+            .expect("structured skill result");
+        assert_eq!(result.get("success").and_then(Value::as_bool), Some(true));
+        assert_eq!(result.get("skillName").and_then(Value::as_str), Some("rea"));
+        assert!(
+            result
+                .get("skillText")
+                .and_then(Value::as_str)
+                .is_some_and(|s| s.contains("ericpq/rea") && s.contains("rea --version"))
+        );
+
+        let bad = tool_call_request("load_skill", json!({"name":"unknown"}));
+        assert_eq!(
+            handle_load_skill(&bad)
+                .result
+                .as_ref()
+                .and_then(|r| r.get("isError"))
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+    }
+
     #[tokio::test]
     async fn read_only_tools_list_exposes_only_local_read_tools() {
         let req = JsonRpcRequest {
@@ -6960,7 +7751,9 @@ mod tests {
             names,
             vec![
                 "iyunzhi_bi_query",
+                "github_repo_read",
                 "catdesk_instruction",
+                "load_skill",
                 "read",
                 "search",
                 "outline",
@@ -8350,6 +9143,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn state_save_failure_is_visible_without_repeating_a_completed_write() {
+        let root = read_workspace("state-save-warning");
+        agent_runtime::update_state(
+            &root,
+            AgentUpdate {
+                goal: Some("persist safety state".into()),
+                status: Some("active".into()),
+                ..AgentUpdate::default()
+            },
+        )
+        .unwrap();
+        std::fs::create_dir(root.join(".catdesk/agent_state.json.tmp")).unwrap();
+        let response = handle_tools_call(
+            &tool_call_request(
+                "write",
+                json!({"path": "changed.txt", "content": "completed"}),
+            ),
+            &root.to_string_lossy(),
+            1,
+            Mode::Computer,
+            ToolMode::MultiTools,
+            false,
+            &CommandJobManager::new(),
+            &None,
+        )
+        .await;
+        assert!(!tool_response_is_error(&response));
+        assert_eq!(
+            std::fs::read_to_string(root.join("changed.txt")).unwrap(),
+            "completed"
+        );
+        let result = response.result.as_ref().unwrap();
+        assert!(
+            result["structuredContent"]["agentStateWarning"]
+                .as_str()
+                .unwrap()
+                .contains("do not repeat")
+        );
+        assert!(result["_meta"]["catdesk/agentStateWarning"].is_string());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
     async fn observable_write_requires_a_later_verification_action() {
         let workspace_root = read_workspace("agent-verification");
         let workspace_root_str = workspace_root.to_string_lossy().into_owned();
@@ -8406,7 +9242,10 @@ mod tests {
         .unwrap();
 
         let read_response = handle_tools_call(
-            &tool_call_request("read", json!({ "paths": ["verify.txt"] })),
+            &tool_call_request(
+                "run_checks",
+                json!({ "kind": "generic", "command": "test \"$(cat verify.txt)\" = changed" }),
+            ),
             &workspace_root_str,
             1,
             Mode::Computer,
@@ -9290,7 +10129,10 @@ hello world"
 
     #[test]
     fn widget_resources_follow_show_detail_mode() {
-        for mode in [ShowDetailMode::Expanded, ShowDetailMode::Collapsed] {
+        for (mode, uri) in [
+            (ShowDetailMode::Expanded, UI_TEMPLATE_URI),
+            (ShowDetailMode::Collapsed, STATUS_TEMPLATE_URI),
+        ] {
             let list_response = handle_resources_list_with_show_detail_mode(
                 &resources_list_request(),
                 Some("https://example.ngrok.app"),
@@ -9307,7 +10149,7 @@ hello world"
             );
 
             let read_response = handle_resources_read_with_show_detail_mode(
-                &resources_read_request(UI_TEMPLATE_URI),
+                &resources_read_request(uri),
                 Some("https://example.ngrok.app"),
                 1,
                 mode,
@@ -9576,20 +10418,57 @@ hello world"
             "Disable must leave the tool result untouched"
         );
 
-        for (mode, expected) in [
-            (ShowDetailMode::Expanded, "expanded"),
-            (ShowDetailMode::Collapsed, "collapsed"),
-        ] {
-            let result = enrich_tool_result_with_show_detail_mode(&req, raw.clone(), None, mode);
-            let payload = result
-                .get("_meta")
-                .and_then(|meta| meta.get(WIDGET_PAYLOAD_META_KEY))
-                .expect("missing injected widget payload");
-            assert_eq!(
-                payload.get("showDetailMode").and_then(Value::as_str),
-                Some(expected)
-            );
-        }
+        let collapsed = enrich_tool_result_with_show_detail_mode(
+            &req,
+            raw.clone(),
+            None,
+            ShowDetailMode::Collapsed,
+        );
+        assert_eq!(
+            collapsed, raw,
+            "Collapsed progress mode must not enrich ordinary tool results"
+        );
+
+        let expanded = enrich_tool_result_with_show_detail_mode(
+            &req,
+            raw.clone(),
+            None,
+            ShowDetailMode::Expanded,
+        );
+        let payload = expanded
+            .get("_meta")
+            .and_then(|meta| meta.get(WIDGET_PAYLOAD_META_KEY))
+            .expect("missing injected widget payload");
+        assert_eq!(
+            payload.get("showDetailMode").and_then(Value::as_str),
+            Some("expanded")
+        );
+
+        let status_req = tool_call_request("agent_status", json!({}));
+        let status_raw = json!({
+            "content": [{ "type": "text", "text": "active" }],
+            "structuredContent": {
+                "toolName": "agent_status",
+                "state": { "status": "active", "phase": "testing", "plan": [] },
+                "activity": { "busy": true, "running": [] },
+                "health": { "status": "healthy" }
+            }
+        });
+        let status_result = enrich_tool_result_with_show_detail_mode(
+            &status_req,
+            status_raw,
+            None,
+            ShowDetailMode::Collapsed,
+        );
+        let status_payload = status_result
+            .get("_meta")
+            .and_then(|meta| meta.get(WIDGET_PAYLOAD_META_KEY))
+            .expect("missing agent status widget payload");
+        assert_eq!(
+            status_payload.get("showDetailMode").and_then(Value::as_str),
+            Some("collapsed")
+        );
+        assert!(status_payload.get("agentState").is_some());
     }
 
     #[tokio::test]

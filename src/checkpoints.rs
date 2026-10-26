@@ -102,7 +102,10 @@ fn safe_relative(path: &str) -> Option<PathBuf> {
     let candidate = Path::new(path);
     // `root.join("")` is the root, so an empty path would ask an `Absent` entry
     // to delete the whole workspace.
-    if path.is_empty() || candidate.is_absolute() {
+    if path.is_empty()
+        || candidate.is_absolute()
+        || candidate.components().next() == Some(Component::CurDir)
+    {
         return None;
     }
     if candidate
@@ -112,6 +115,23 @@ fn safe_relative(path: &str) -> Option<PathBuf> {
         return None;
     }
     Some(candidate.to_path_buf())
+}
+
+fn safe_restore_path(workspace_root: &Path, relative: &Path) -> Option<PathBuf> {
+    let mut target = workspace_root.canonicalize().ok()?;
+    for component in relative.components() {
+        let Component::Normal(name) = component else {
+            return None;
+        };
+        target.push(name);
+        match fs::symlink_metadata(&target) {
+            Ok(metadata) if metadata.is_symlink() => return None,
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(_) => return None,
+        }
+    }
+    Some(target)
 }
 
 fn relative_to_root(workspace_root: &Path, path: &Path) -> Option<String> {
@@ -301,8 +321,19 @@ pub fn list(workspace_root: &Path) -> Vec<Checkpoint> {
     let mut checkpoints: Vec<Checkpoint> = entries
         .filter_map(|entry| entry.ok())
         .filter_map(|entry| {
-            let manifest = fs::read_to_string(entry.path().join("manifest.json")).ok()?;
-            serde_json::from_str::<Checkpoint>(&manifest).ok()
+            let name = entry.file_name();
+            let id = name.to_str()?;
+            let relative = safe_relative(id)?;
+            if relative.components().count() != 1 {
+                return None;
+            }
+            let manifest_path = Path::new(CHECKPOINT_DIR)
+                .join(relative)
+                .join("manifest.json");
+            let manifest_path = safe_restore_path(workspace_root, &manifest_path)?;
+            let manifest = fs::read_to_string(manifest_path).ok()?;
+            let checkpoint = serde_json::from_str::<Checkpoint>(&manifest).ok()?;
+            (checkpoint.id == id).then_some(checkpoint)
         })
         .collect();
     // Newest first. The sequence decides it; the timestamp and id only order
@@ -364,19 +395,32 @@ pub fn restore(
             .ok_or_else(|| "No checkpoint has been recorded yet".to_string())?,
     };
 
-    let blobs = checkpoints_root(workspace_root)
-        .join(&checkpoint.id)
-        .join("blobs");
+    let blobs = Path::new(CHECKPOINT_DIR).join(&checkpoint.id).join("blobs");
     let mut report = RestoreReport::default();
     for entry in &checkpoint.entries {
         let Some(relative) = safe_relative(&entry.path) else {
             report.skipped.push(entry.path.clone());
             continue;
         };
-        let target = workspace_root.join(&relative);
+        if relative.starts_with(".catdesk") {
+            report.skipped.push(entry.path.clone());
+            continue;
+        }
+        let Some(target) = safe_restore_path(workspace_root, &relative) else {
+            report.skipped.push(entry.path.clone());
+            continue;
+        };
         match entry.kind {
             EntryKind::File => {
                 let Some(blob) = entry.blob.as_ref() else {
+                    report.skipped.push(entry.path.clone());
+                    continue;
+                };
+                if blob.parse::<usize>().is_err() {
+                    report.skipped.push(entry.path.clone());
+                    continue;
+                }
+                let Some(source) = safe_restore_path(workspace_root, &blobs.join(blob)) else {
                     report.skipped.push(entry.path.clone());
                     continue;
                 };
@@ -384,7 +428,7 @@ pub fn restore(
                     .parent()
                     .map(|parent| fs::create_dir_all(parent))
                     .unwrap_or(Ok(()))
-                    .and_then(|_| fs::copy(blobs.join(blob), &target).map(|_| ()));
+                    .and_then(|_| fs::copy(source, &target).map(|_| ()));
                 match restored {
                     Ok(()) => report.restored.push(entry.path.clone()),
                     Err(_) => report.skipped.push(entry.path.clone()),
@@ -421,6 +465,71 @@ mod tests {
         ));
         std::fs::create_dir_all(&root).expect("create workspace");
         root.canonicalize().expect("canonical workspace")
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_rejects_symlinks_in_targets_and_blob_storage() {
+        use std::os::unix::fs::symlink;
+        let root = workspace("restore-symlink");
+        let outside = workspace("restore-outside");
+        fs::create_dir_all(root.join("pkg")).unwrap();
+        fs::write(root.join("pkg/a.txt"), "before").unwrap();
+        fs::write(outside.join("a.txt"), "untouched").unwrap();
+        let checkpoint = capture(&root, "write", &[root.join("pkg/a.txt")]).unwrap();
+        fs::remove_dir_all(root.join("pkg")).unwrap();
+        symlink(&outside, root.join("pkg")).unwrap();
+        let (_, report) = restore(&root, Some(&checkpoint.id)).unwrap();
+        assert_eq!(report.skipped, vec!["pkg/a.txt"]);
+        assert_eq!(
+            fs::read_to_string(outside.join("a.txt")).unwrap(),
+            "untouched"
+        );
+        fs::remove_file(root.join("pkg")).unwrap();
+        fs::create_dir(root.join("pkg")).unwrap();
+        symlink(outside.join("a.txt"), root.join("pkg/a.txt")).unwrap();
+        let (_, report) = restore(&root, Some(&checkpoint.id)).unwrap();
+        assert_eq!(report.skipped, vec!["pkg/a.txt"]);
+        assert_eq!(
+            fs::read_to_string(outside.join("a.txt")).unwrap(),
+            "untouched"
+        );
+        fs::remove_file(root.join("pkg/a.txt")).unwrap();
+        let blob = checkpoints_root(&root).join(&checkpoint.id).join("blobs/0");
+        fs::remove_file(&blob).unwrap();
+        symlink(outside.join("a.txt"), &blob).unwrap();
+        let (_, report) = restore(&root, Some(&checkpoint.id)).unwrap();
+        assert_eq!(report.skipped, vec!["pkg/a.txt"]);
+        assert!(!root.join("pkg/a.txt").exists());
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(outside).unwrap();
+    }
+
+    #[test]
+    fn restore_rejects_tampered_root_blob_and_checkpoint_id() {
+        let root = workspace("restore-tamper");
+        fs::write(root.join("a.txt"), "before").unwrap();
+        let checkpoint = capture(&root, "write", &[root.join("a.txt")]).unwrap();
+        let manifest = checkpoints_root(&root)
+            .join(&checkpoint.id)
+            .join("manifest.json");
+        let mut tampered = checkpoint.clone();
+        tampered.entries[0].path = ".".into();
+        tampered.entries[0].kind = EntryKind::Absent;
+        fs::write(&manifest, serde_json::to_vec(&tampered).unwrap()).unwrap();
+        let (_, report) = restore(&root, Some(&checkpoint.id)).unwrap();
+        assert_eq!(report.skipped, vec!["."]);
+        assert!(root.join("a.txt").exists());
+        tampered = checkpoint.clone();
+        tampered.entries[0].blob = Some("../manifest.json".into());
+        fs::write(&manifest, serde_json::to_vec(&tampered).unwrap()).unwrap();
+        let (_, report) = restore(&root, Some(&checkpoint.id)).unwrap();
+        assert_eq!(report.skipped, vec!["a.txt"]);
+        assert_eq!(fs::read_to_string(root.join("a.txt")).unwrap(), "before");
+        tampered.id = "../outside".into();
+        fs::write(&manifest, serde_json::to_vec(&tampered).unwrap()).unwrap();
+        assert!(list(&root).is_empty());
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

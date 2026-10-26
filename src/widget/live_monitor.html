@@ -7,58 +7,74 @@
     <title>CatDesk Monitor</title>
     <style>
       :root {
-        --bg: #0b0e13;
-        --card: #141922;
-        --card-2: #171d27;
-        --edge: rgba(255,255,255,.06);
-        --edge-2: rgba(255,255,255,.10);
-        --fg: #e8ecf4;
-        --dim: #939cad;
-        --faint: #626b7b;
-        --idle: #39414f;
+        --bg: #090d14;
+        --card: #111722;
+        --card-2: #161e2b;
+        --edge: rgba(255,255,255,.07);
+        --edge-2: rgba(255,255,255,.12);
+        --fg: #edf2fb;
+        --dim: #98a4b8;
+        --faint: #637087;
+        --idle: #3b4556;
         --busy: #5b9dff;
-        --ok: #3ddc97;
-        --bad: #ff6b6b;
+        --ok: #45d39a;
+        --bad: #ff6b76;
+        --warn: #f2b84b;
+        --violet: #a78bfa;
+        --cyan: #4cc9f0;
         --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-        --r: 12px;
+        --r: 14px;
       }
       * { box-sizing: border-box; }
       body {
-        margin: 0; background: var(--bg); color: var(--fg);
+        margin: 0;
+        background:
+          radial-gradient(circle at 20% -10%, rgba(91,157,255,.10), transparent 30%),
+          radial-gradient(circle at 95% 8%, rgba(69,211,154,.06), transparent 24%),
+          var(--bg);
+        color: var(--fg);
         font: 400 13px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI",
           "Microsoft YaHei", sans-serif;
         -webkit-font-smoothing: antialiased;
       }
-      #app { max-width: 680px; margin: 0 auto; padding: 0 0 28px; }
+      #app { max-width: 1160px; margin: 0 auto; padding-bottom: 18px; }
 
       .bar {
-        display: flex; align-items: center; gap: 9px;
-        padding: 13px 20px; border-bottom: 1px solid var(--edge);
-        position: sticky; top: 0; background: rgba(11,14,19,.92);
-        backdrop-filter: blur(8px); z-index: 5;
+        display: flex; align-items: center; gap: 10px;
+        padding: 10px 18px; border-bottom: 1px solid var(--edge);
+        position: sticky; top: 0; background: rgba(9,13,20,.88);
+        backdrop-filter: blur(12px); z-index: 5;
       }
-      .brand { font-size: 12px; font-weight: 500; letter-spacing: .04em; }
+      .brand { font-size: 13px; font-weight: 650; letter-spacing: .03em; }
+      .version {
+        color: var(--faint); font: 500 10px var(--mono);
+        border: 1px solid var(--edge); border-radius: 999px; padding: 2px 7px;
+      }
       .conn {
         margin-left: auto; font-size: 11px; color: var(--faint);
-        display: flex; align-items: center; gap: 6px;
+        display: flex; align-items: center; gap: 7px;
       }
-      .conn i { width: 5px; height: 5px; border-radius: 50%; background: var(--ok); }
-      body[data-conn="0"] .conn i { background: var(--bad); }
+      .conn i {
+        width: 6px; height: 6px; border-radius: 50%; background: var(--ok);
+        box-shadow: 0 0 12px rgba(69,211,154,.45);
+      }
+      body[data-conn="0"] .conn i { background: var(--bad); box-shadow: none; }
       body[data-conn="0"] .conn span::after { content: "断开"; }
       body[data-conn="1"] .conn span::after { content: "已连接"; }
 
-      .wrap { padding: 18px 20px 0; }
-
+      .wrap { padding: 12px 18px 0; }
       .hero {
-        background: var(--card); border: 1px solid var(--edge);
-        border-radius: var(--r); padding: 16px 18px 12px; margin-bottom: 14px;
+        background: linear-gradient(145deg, rgba(22,30,43,.98), rgba(17,23,34,.98));
+        border: 1px solid var(--edge-2);
+        border-radius: 16px; padding: 12px 16px 9px; margin-bottom: 10px;
+        box-shadow: 0 16px 60px rgba(0,0,0,.18);
       }
       .hero-top {
         display: flex; align-items: flex-start; justify-content: space-between;
-        gap: 16px; margin-bottom: 12px;
+        gap: 14px; margin-bottom: 8px;
       }
       .lede { min-width: 0; }
-      .status { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
+      .status { display: flex; align-items: center; gap: 8px; margin-bottom: 7px; }
       #dot {
         width: 9px; height: 9px; border-radius: 50%; flex: none;
         background: var(--idle); transition: background .2s ease;
@@ -68,67 +84,142 @@
       }
       @keyframes pulse {
         0% { box-shadow: 0 0 0 0 rgba(91,157,255,.5); }
-        70% { box-shadow: 0 0 0 7px rgba(91,157,255,0); }
+        70% { box-shadow: 0 0 0 8px rgba(91,157,255,0); }
         100% { box-shadow: 0 0 0 0 rgba(91,157,255,0); }
       }
-      #state {
-        font-size: 13px; font-weight: 500; letter-spacing: .01em;
-      }
+      #state { font-size: 12px; font-weight: 650; color: var(--dim); }
       #headline {
-        font-size: 15px; font-weight: 500; margin-bottom: 3px;
+        font-size: 16px; font-weight: 650; margin-bottom: 2px;
         overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
       }
       #subline {
-        font: 400 11.5px/1.4 var(--mono); color: var(--faint);
+        font: 400 11.5px/1.45 var(--mono); color: var(--faint);
         overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
       }
       #clock {
-        flex: none; font: 500 28px/1 var(--mono); letter-spacing: -.02em;
+        flex: none; font: 600 24px/1 var(--mono); letter-spacing: -.03em;
         font-variant-numeric: tabular-nums; transition: color .2s ease;
       }
       body[data-busy="0"] #clock { color: var(--faint); font-size: 14px; }
 
-      #graph {
-        display: flex; align-items: flex-end; gap: 2px; height: 44px;
-      }
+      #graph { display: flex; align-items: flex-end; gap: 2px; height: 34px; }
       #graph span {
-        flex: 1; border-radius: 2px 2px 0 0; background: #212836; height: 5%;
+        flex: 1; border-radius: 3px 3px 1px 1px; background: #202838; height: 5%;
         transition: height .3s cubic-bezier(.2,.7,.3,1), background .3s ease;
       }
       .axis {
         display: flex; justify-content: space-between;
-        font-size: 10px; color: #4b5361; margin-top: 6px;
+        font-size: 10px; color: #4c586c; margin-top: 6px;
       }
 
       .tiles {
-        display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px;
-        margin-bottom: 16px;
+        display: grid; grid-template-columns: repeat(6, 1fr); gap: 8px;
+        margin-bottom: 10px;
       }
       .tile {
-        background: var(--card); border: 1px solid var(--edge);
-        border-radius: 10px; padding: 10px 12px;
+        background: rgba(17,23,34,.92); border: 1px solid var(--edge);
+        border-radius: 11px; padding: 8px 10px; min-width: 0;
       }
       .tile b {
-        display: block; font: 500 18px/1.2 var(--mono);
-        font-variant-numeric: tabular-nums; margin-bottom: 2px;
+        display: block; font: 600 17px/1.15 var(--mono);
+        font-variant-numeric: tabular-nums; margin-bottom: 3px;
+        overflow: hidden; text-overflow: ellipsis;
       }
       .tile span { font-size: 10.5px; color: var(--faint); }
-      .tile.warn b { color: var(--bad); }
+      .tile.bad b { color: var(--bad); }
+      .tile.warn b { color: var(--warn); }
+      .tile.good b { color: var(--ok); }
 
       h2 {
-        font-size: 11px; font-weight: 500; letter-spacing: .08em;
+        font-size: 11px; font-weight: 650; letter-spacing: .08em;
         color: var(--faint); margin: 0 0 8px; padding: 0 2px;
         display: flex; justify-content: space-between; align-items: baseline;
       }
-      h2 em { font-style: normal; color: #4b5361; }
+      h2 em { font-style: normal; color: #4d596d; font-weight: 500; letter-spacing: 0; }
+
+      .dashboard {
+        display: grid; grid-template-columns: .9fr .9fr 1.2fr;
+        gap: 10px; margin-bottom: 10px;
+      }
+      .chart-card {
+        background: rgba(17,23,34,.92); border: 1px solid var(--edge);
+        border-radius: var(--r); padding: 10px 12px; min-width: 0;
+      }
+      .chart-card h3 {
+        margin: 0 0 2px; font-size: 12px; font-weight: 650;
+      }
+      .chart-card .desc { color: var(--faint); font-size: 9.5px; margin-bottom: 7px; }
+
+      .health-wrap {
+        display: grid; grid-template-columns: 112px minmax(0, 1fr);
+        align-items: center; gap: 10px; min-height: 108px;
+      }
+      .gauge {
+        width: 108px; height: 68px; position: relative; overflow: hidden;
+        margin: 0 auto;
+      }
+      .gauge-arc {
+        position: absolute; left: 6px; top: 6px; width: 96px; height: 96px;
+        border: 10px solid #222b3a; border-radius: 50%;
+      }
+      .gauge-arc::before {
+        content: ""; position: absolute; inset: -10px; border-radius: 50%;
+        border: 10px solid transparent;
+        border-top-color: var(--ok); border-right-color: var(--ok);
+        transform: rotate(-45deg);
+        opacity: .82;
+      }
+      .needle {
+        position: absolute; left: 53px; top: 53px; width: 39px; height: 2px;
+        border-radius: 2px; background: var(--fg); transform-origin: 0 50%;
+        transform: rotate(-90deg); transition: transform .45s cubic-bezier(.2,.7,.3,1);
+        box-shadow: 0 0 8px rgba(255,255,255,.18);
+      }
+      .needle::after {
+        content: ""; position: absolute; left: -4px; top: -4px;
+        width: 10px; height: 10px; border-radius: 50%; background: var(--fg);
+      }
+      .gauge-score {
+        position: absolute; left: 0; right: 0; bottom: 0;
+        text-align: center; font: 700 19px/1 var(--mono);
+      }
+      .gauge-score small { font-size: 10px; color: var(--faint); font-weight: 500; }
+      .health-copy strong { display: block; font-size: 13px; margin-bottom: 3px; }
+      .health-copy span { color: var(--dim); font-size: 10px; line-height: 1.45; }
+
+      .failure-wrap {
+        display: grid; grid-template-columns: 92px minmax(0, 1fr);
+        align-items: center; gap: 10px; min-height: 108px;
+      }
+      .donut {
+        width: 88px; height: 88px; border-radius: 50%;
+        display: grid; place-items: center; position: relative;
+        background: #222b3a;
+      }
+      .donut::after {
+        content: ""; width: 54px; height: 54px; border-radius: 50%;
+        background: var(--card); border: 1px solid var(--edge);
+      }
+      .donut-center {
+        position: absolute; z-index: 1; text-align: center;
+        font: 700 16px/1.1 var(--mono);
+      }
+      .donut-center small {
+        display: block; margin-top: 3px; color: var(--faint); font: 500 9px/1 var(--mono);
+      }
+      .legend { display: grid; gap: 4px; }
+      .legend-row { display: grid; grid-template-columns: 8px 1fr auto; gap: 7px; align-items: center; }
+      .legend-row i { width: 7px; height: 7px; border-radius: 50%; }
+      .legend-row span { color: var(--dim); font-size: 10.5px; }
+      .legend-row b { font: 600 11px var(--mono); }
 
       .panel {
-        background: var(--card); border: 1px solid var(--edge);
-        border-radius: var(--r); overflow: hidden; margin-bottom: 16px;
+        background: rgba(17,23,34,.92); border: 1px solid var(--edge);
+        border-radius: var(--r); overflow: auto; margin-bottom: 0;
       }
       .row {
-        display: flex; align-items: baseline; gap: 10px;
-        padding: 9px 14px; border-bottom: 1px solid var(--edge);
+        display: flex; align-items: flex-start; gap: 9px;
+        padding: 7px 10px; border-bottom: 1px solid var(--edge);
       }
       .row:last-child { border-bottom: 0; }
       .row.fresh { animation: land .7s ease-out; }
@@ -137,74 +228,168 @@
         to { background: transparent; }
       }
       .rdot {
-        width: 6px; height: 6px; border-radius: 50%; flex: none;
-        position: relative; top: -1px;
+        width: 7px; height: 7px; border-radius: 50%; flex: none;
+        position: relative; top: 5px;
       }
-      .rtool { flex: none; font-size: 12.5px; font-weight: 500; }
+      .rtool { flex: none; width: 108px; font-size: 11px; font-weight: 650; }
       .rbody { flex: 1 1 auto; min-width: 0; }
       .rdetail {
         overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-        font: 400 11px var(--mono); color: var(--faint);
+        font: 400 9.5px var(--mono); color: var(--faint);
       }
       .rreason {
-        font: 400 11px/1.45 var(--mono); color: var(--bad);
-        white-space: pre-wrap; word-break: break-word; margin-top: 3px;
+        font: 400 9.5px/1.35 var(--mono); color: var(--dim);
+        white-space: pre-wrap; word-break: break-word; margin-top: 4px;
       }
+      .rbadge {
+        flex: none; border: 1px solid var(--edge-2); border-radius: 999px;
+        padding: 1px 6px; font-size: 9px; white-space: nowrap;
+      }
+      .rbadge.ok { color: var(--ok); background: rgba(69,211,154,.06); }
+      .rbadge.bad { color: var(--bad); background: rgba(255,107,118,.07); }
+      .rbadge.warn { color: var(--warn); background: rgba(242,184,75,.07); }
+      .rbadge.violet { color: var(--violet); background: rgba(167,139,250,.07); }
+      .rbadge.cyan { color: var(--cyan); background: rgba(76,201,240,.07); }
       .rtime {
-        flex: none; font: 400 11px var(--mono); color: var(--dim);
+        flex: none; width: 58px; text-align: right;
+        font: 500 10.5px var(--mono); color: var(--dim);
         font-variant-numeric: tabular-nums;
       }
       .rago {
-        flex: none; font-size: 10px; color: #4b5361; width: 42px;
+        flex: none; font-size: 9.5px; color: #4d596d; width: 38px;
         text-align: right; font-variant-numeric: tabular-nums;
       }
-      .empty { padding: 16px 14px; font-size: 12px; color: var(--faint); }
+      .empty { padding: 18px 14px; font-size: 12px; color: var(--faint); }
 
       .trow {
-        display: flex; align-items: center; gap: 12px;
-        padding: 8px 14px; border-bottom: 1px solid var(--edge);
+        display: grid; grid-template-columns: 105px minmax(70px,1fr) 96px;
+        align-items: center; gap: 8px; padding: 6px 8px;
+        border-bottom: 1px solid var(--edge);
       }
       .trow:last-child { border-bottom: 0; }
-      .tname { flex: none; width: 126px; font-size: 12.5px; font-weight: 500; }
+      .tname { font-size: 10.5px; font-weight: 650; overflow: hidden; text-overflow: ellipsis; }
       .tbar {
-        flex: 1 1 auto; height: 6px; border-radius: 3px;
-        background: #1b2130; overflow: hidden;
+        height: 7px; border-radius: 5px; background: #1d2635;
+        overflow: hidden; position: relative;
       }
       .tbar i {
-        display: block; height: 100%; border-radius: 3px; background: var(--busy);
+        display: block; height: 100%; border-radius: 5px; background: var(--busy);
         transition: width .35s cubic-bezier(.2,.7,.3,1);
       }
+      .tbar b {
+        display: block; height: 100%; position: absolute; right: 0; top: 0;
+        background: var(--bad); opacity: .9;
+      }
       .tnum {
-        flex: none; width: 104px; text-align: right; font: 400 11px var(--mono);
+        text-align: right; font: 400 9.5px var(--mono);
         color: var(--dim); font-variant-numeric: tabular-nums;
       }
+      .tnum .badnum { color: var(--bad); }
 
-      /* A desktop widget window is narrow. Keep the same information, drop
-         the padding and let the tiles wrap to two columns. */
+      .timeline-row {
+        display: grid; grid-template-columns: 110px minmax(80px,1fr) 48px;
+        gap: 8px; align-items: center; padding: 6px 9px;
+        border-bottom: 1px solid var(--edge);
+      }
+      .timeline-row:last-child { border-bottom: 0; }
+      .timeline-name {
+        font-size: 10.5px; font-weight: 600; overflow: hidden;
+        text-overflow: ellipsis; white-space: nowrap;
+      }
+      .timeline-track {
+        height: 7px; background: #1d2635; border-radius: 5px; overflow: hidden;
+      }
+      .timeline-bar {
+        height: 100%; min-width: 3px; border-radius: 5px; background: var(--busy);
+        transition: width .35s cubic-bezier(.2,.7,.3,1);
+      }
+      .timeline-bar.ok { background: var(--ok); }
+      .timeline-bar.bad { background: var(--bad); }
+      .timeline-bar.warn { background: var(--warn); }
+      .timeline-bar.violet { background: var(--violet); }
+      .timeline-bar.cyan { background: var(--cyan); }
+      .timeline-time { text-align: right; font: 500 9.5px var(--mono); color: var(--dim); }
+
+      .mini-head {
+        display: flex; align-items: baseline; justify-content: space-between;
+        gap: 8px; margin-bottom: 7px;
+      }
+      .mini-head strong { font-size: 12px; font-weight: 650; }
+      .mini-head span { color: var(--faint); font-size: 9.5px; }
+      .chart-card .panel { max-height: 132px; }
+      .bottom-grid {
+        display: grid; grid-template-columns: .9fr 1.1fr; gap: 10px;
+      }
+      .bottom-card {
+        background: rgba(17,23,34,.92); border: 1px solid var(--edge);
+        border-radius: var(--r); padding: 10px 12px; min-width: 0;
+      }
+      .bottom-card .panel { max-height: 205px; }
+
+      @media (max-width: 860px) {
+        .tiles { grid-template-columns: repeat(3, 1fr); }
+        .dashboard { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+        .dashboard .chart-card:last-child { grid-column: 1 / -1; }
+        .bottom-grid { grid-template-columns: .9fr 1.1fr; }
+        .health-wrap, .failure-wrap {
+          grid-template-columns: 84px minmax(0, 1fr); min-height: 82px; gap: 7px;
+        }
+        .gauge { width: 84px; height: 55px; }
+        .gauge-arc { left: 5px; top: 5px; width: 74px; height: 74px; border-width: 8px; }
+        .gauge-arc::before { inset: -8px; border-width: 8px; }
+        .needle { left: 41px; top: 41px; width: 30px; }
+        .gauge-score { font-size: 17px; }
+        .donut { width: 72px; height: 72px; }
+        .donut::after { width: 44px; height: 44px; }
+        .donut-center { font-size: 14px; }
+        .chart-card .panel { max-height: 118px; }
+        .bottom-card .panel { max-height: 166px; }
+        .rbody, .rago { display: none; }
+        .rtool { width: auto; flex: 1 1 auto; }
+        .row { align-items: center; }
+      }
       @media (max-width: 520px) {
         .bar { padding: 11px 14px; }
         .wrap { padding: 14px 14px 0; }
-        .hero { padding: 14px 14px 10px; }
+        .hero { padding: 14px 14px 11px; border-radius: 14px; }
         .hero-top { gap: 10px; margin-bottom: 10px; }
         #clock { font-size: 24px; }
-        body[data-busy="0"] #clock { font-size: 13px; }
-        #headline { font-size: 14px; }
-        #graph { height: 38px; }
+        body[data-busy="0"] #clock { font-size: 12px; }
+        #headline { font-size: 15px; }
+        #graph { height: 42px; }
         .tiles { grid-template-columns: repeat(2, 1fr); gap: 7px; }
-        .tile { padding: 9px 11px; }
-        .tile b { font-size: 16px; }
-        .row { padding: 8px 12px; gap: 8px; }
-        .rtool { font-size: 12px; }
-        .trow { padding: 7px 12px; gap: 9px; }
-        .tname { width: 92px; font-size: 12px; }
-        .tnum { width: 86px; }
+        .tile { padding: 9px 10px; }
+        .tile b { font-size: 17px; }
+        .dashboard, .bottom-grid { grid-template-columns: 1fr; }
+        .dashboard .chart-card:last-child { grid-column: auto; }
+        .chart-card .panel, .bottom-card .panel { max-height: none; }
+        .health-wrap, .failure-wrap { grid-template-columns: 1fr; text-align: center; }
+        .gauge { width: 108px; height: 68px; }
+        .gauge-arc { left: 6px; top: 6px; width: 96px; height: 96px; border-width: 10px; }
+        .gauge-arc::before { inset: -10px; border-width: 10px; }
+        .needle { left: 53px; top: 53px; width: 39px; }
+        .donut { width: 88px; height: 88px; margin: 0 auto; }
+        .donut::after { width: 54px; height: 54px; }
+        .legend { max-width: 220px; margin: 0 auto; width: 100%; text-align: left; }
+        .row { padding: 9px 10px; gap: 7px; }
+        .rbody { display: block; }
+        .rtool { width: 82px; font-size: 11px; flex: none; }
+        .rbadge { display: none; }
+        .rtime { width: 48px; font-size: 10px; }
+        .rago { display: none; }
+        .trow { grid-template-columns: 92px minmax(70px,1fr) 92px; gap: 8px; padding: 8px 10px; }
+        .tname { font-size: 11px; }
+        .tnum { font-size: 9.5px; }
+        .timeline-row { grid-template-columns: 92px minmax(70px,1fr) 48px; gap: 8px; padding: 8px 10px; }
+        .timeline-name { font-size: 10.5px; }
       }
     </style>
   </head>
   <body data-busy="0" data-conn="1">
     <div id="app">
       <div class="bar">
-        <span class="brand">CatDesk</span>
+        <span class="brand">CatDesk Monitor</span>
+        <span class="version">LIVE</span>
         <span class="conn"><i></i><span></span></span>
       </div>
 
@@ -226,14 +411,55 @@
           <div class="tile"><b id="s-session">—</b><span>本次会话</span></div>
           <div class="tile"><b id="s-calls">—</b><span>累计调用</span></div>
           <div class="tile"><b id="s-tokens">—</b><span>累计 token</span></div>
-          <div class="tile" id="tile-failed"><b id="s-failed">—</b><span>失败</span></div>
+          <div class="tile" id="tile-real-failed"><b id="s-real-failed">—</b><span>真正失败</span></div>
+          <div class="tile" id="tile-guarded"><b id="s-guarded">—</b><span>保护性拦截</span></div>
+          <div class="tile good" id="tile-health"><b id="s-health">—</b><span>运行健康</span></div>
         </div>
 
-        <h2><span>最近</span><em id="recent-note"></em></h2>
-        <div class="panel" id="recent"><div class="empty">暂无调用</div></div>
+        <div class="dashboard">
+          <div class="chart-card">
+            <h3>运行健康</h3>
+            <div class="desc">只对真正执行故障扣分</div>
+            <div class="health-wrap">
+              <div class="gauge">
+                <div class="gauge-arc"></div>
+                <div class="needle" id="health-needle"></div>
+                <div class="gauge-score"><span id="health-score">100</span><small>%</small></div>
+              </div>
+              <div class="health-copy">
+                <strong id="health-label">健康</strong>
+                <span id="health-copy">最近运行没有真正执行故障。</span>
+              </div>
+            </div>
+          </div>
 
-        <h2><span>按工具</span><em id="tools-note"></em></h2>
-        <div class="panel" id="tools"><div class="empty">暂无数据</div></div>
+          <div class="chart-card">
+            <h3>失败构成</h3>
+            <div class="desc">红色才是执行故障</div>
+            <div class="failure-wrap">
+              <div class="donut" id="failure-donut">
+                <div class="donut-center"><span id="failure-total">0</span><small>原始失败</small></div>
+              </div>
+              <div class="legend" id="failure-legend"></div>
+            </div>
+          </div>
+
+          <div class="chart-card">
+            <div class="mini-head"><strong>工具调用</strong><span id="tools-note"></span></div>
+            <div class="panel" id="tools"><div class="empty">暂无数据</div></div>
+          </div>
+        </div>
+
+        <div class="bottom-grid">
+          <div class="bottom-card">
+            <div class="mini-head"><strong>最近耗时</strong><span>横条越长越慢</span></div>
+            <div class="panel" id="timeline"><div class="empty">暂无调用</div></div>
+          </div>
+          <div class="bottom-card">
+            <div class="mini-head"><strong>最近调用</strong><span id="recent-note"></span></div>
+            <div class="panel" id="recent"><div class="empty">暂无调用</div></div>
+          </div>
+        </div>
       </div>
     </div>
 
@@ -242,13 +468,12 @@
         var BASE = location.pathname.replace(/\/live\/?$/, "");
         var STREAM = BASE + "/activity/stream";
         var ACTIVITY = BASE + "/activity";
-        // A call is often under ten milliseconds. The event arrives, but the
-        // eye needs longer than that, so a call stays on screen for this long.
         var MIN_SHOW = 900;
         var SNAPSHOT_MS = 2000;
-        var SHOW_RECENT = 5;
-        var SHOW_TOOLS = 8;
-        var BUCKETS = 46;
+        var SHOW_RECENT = 6;
+        var SHOW_TOOLS = 6;
+        var SHOW_TIMELINE = 6;
+        var BUCKETS = 52;
         var BUCKET_MS = 4000;
 
         var body = document.body;
@@ -259,6 +484,7 @@
         var graph = document.getElementById("graph");
         var recentEl = document.getElementById("recent");
         var toolsEl = document.getElementById("tools");
+        var timelineEl = document.getElementById("timeline");
 
         var bars = [];
         for (var i = 0; i < BUCKETS; i++) {
@@ -307,25 +533,48 @@
           });
         }
 
-        // Drawn from the server's own timestamps, so opening the page part-way
-        // through a session shows the session rather than a blank strip.
+        function kindOf(r) {
+          if (r.ok) return "ok";
+          return r.failureKind || "execution";
+        }
+
+        function kindMeta(kind) {
+          switch (kind) {
+            case "verification": return { label: "流程拦截", cls: "warn", color: "var(--warn)" };
+            case "edit_conflict": return { label: "编辑冲突", cls: "warn", color: "#ffd166" };
+            case "timeout": return { label: "超时", cls: "violet", color: "var(--violet)" };
+            case "transient": return { label: "瞬时异常", cls: "cyan", color: "var(--cyan)" };
+            case "execution": return { label: "执行失败", cls: "bad", color: "var(--bad)" };
+            default: return { label: "成功", cls: "ok", color: "var(--ok)" };
+          }
+        }
+
+        function isRealFailure(kind) {
+          return kind === "execution" || kind === "timeout" || kind === "transient";
+        }
+
         function paintGraph(history, serverNow) {
           var counts = new Array(BUCKETS).fill(0);
-          var failed = new Array(BUCKETS).fill(0);
+          var severity = new Array(BUCKETS).fill(0);
           var edge = serverNow || Date.now();
           for (var i = 0; i < history.length; i++) {
             var index = BUCKETS - 1 - Math.floor((edge - history[i][0]) / BUCKET_MS);
             if (index >= 0 && index < BUCKETS) {
               counts[index]++;
-              if (!history[i][1]) failed[index]++;
+              if (!history[i][1]) {
+                var kind = history[i][2] || "execution";
+                severity[index] = Math.max(severity[index], isRealFailure(kind) ? 2 : 1);
+              }
             }
           }
           var peak = Math.max.apply(null, counts) || 1;
           for (var b = 0; b < BUCKETS; b++) {
             var n = counts[b];
-            bars[b].style.height = (n > 0 ? 16 + (n / peak) * 84 : 5) + "%";
+            bars[b].style.height = (n > 0 ? 14 + (n / peak) * 86 : 5) + "%";
             bars[b].style.background =
-              n === 0 ? "#212836" : failed[b] ? "var(--bad)" : "var(--busy)";
+              n === 0 ? "#202838" :
+              severity[b] === 2 ? "var(--bad)" :
+              severity[b] === 1 ? "var(--warn)" : "var(--busy)";
           }
         }
 
@@ -337,7 +586,7 @@
           seeded = true;
           var edge = serverNow || Date.now();
           document.getElementById("recent-note").textContent = list.length
-            ? "共 " + list.length + " 条"
+            ? "保留 " + list.length + " 条"
             : "";
           if (!list.length) {
             recentEl.innerHTML = '<div class="empty">暂无调用</div>';
@@ -346,14 +595,15 @@
           recentEl.innerHTML = list
             .slice(0, SHOW_RECENT)
             .map(function (r, index) {
+              var meta = kindMeta(kindOf(r));
               return (
                 '<div class="row' + (isNew && index === 0 ? " fresh" : "") + '">' +
-                '<span class="rdot" style="background:' +
-                (r.ok ? "var(--ok)" : "var(--bad)") + '"></span>' +
+                '<span class="rdot" style="background:' + meta.color + '"></span>' +
                 '<span class="rtool">' + esc(r.tool) + "</span>" +
                 '<span class="rbody"><span class="rdetail">' + esc(r.detail) + "</span>" +
                 (r.reason ? '<div class="rreason">' + esc(r.reason) + "</div>" : "") +
                 "</span>" +
+                '<span class="rbadge ' + meta.cls + '">' + meta.label + "</span>" +
                 '<span class="rtime">' + human(r.durationMs || 0) + "</span>" +
                 '<span class="rago">' + ago(edge - r.finishedMs) + "</span>" +
                 "</div>"
@@ -363,22 +613,108 @@
         }
 
         function renderTools(list) {
-          if (!list || !list.length) return;
-          document.getElementById("tools-note").textContent = list.length + " 种";
+          if (!list || !list.length) {
+            toolsEl.innerHTML = '<div class="empty">暂无数据</div>';
+            return;
+          }
+          document.getElementById("tools-note").textContent = list.length + " 种工具";
           var peak = list[0].count || 1;
           toolsEl.innerHTML = list
             .slice(0, SHOW_TOOLS)
             .map(function (t) {
+              var real = (t.executionFailed || 0) + (t.timedOut || 0) + (t.transient || 0);
+              var callWidth = Math.max(3, (t.count / peak) * 100);
+              var failWidth = t.count ? Math.min(callWidth, (real / t.count) * callWidth) : 0;
               return (
                 '<div class="trow"><span class="tname">' + esc(t.tool) + "</span>" +
-                '<span class="tbar"><i style="width:' +
-                Math.max(3, (t.count / peak) * 100) + "%;background:" +
-                (t.failed ? "var(--bad)" : "var(--busy)") + '"></i></span>' +
+                '<span class="tbar"><i style="width:' + callWidth + '%"></i>' +
+                (real ? '<b style="width:' + failWidth + '%"></b>' : "") +
+                "</span>" +
                 '<span class="tnum">' + t.count + " 次 · " + human(t.totalMs) +
+                (real ? ' · <span class="badnum">真失败 ' + real + "</span>" : "") +
                 "</span></div>"
               );
             })
             .join("");
+        }
+
+        function renderTimeline(list) {
+          if (!list || !list.length) {
+            timelineEl.innerHTML = '<div class="empty">暂无调用</div>';
+            return;
+          }
+          var visible = list.slice(0, SHOW_TIMELINE);
+          var peak = visible.reduce(function (max, item) {
+            return Math.max(max, item.durationMs || 0);
+          }, 1);
+          timelineEl.innerHTML = visible.map(function (r) {
+            var meta = kindMeta(kindOf(r));
+            var width = Math.max(2, ((r.durationMs || 0) / peak) * 100);
+            return (
+              '<div class="timeline-row">' +
+              '<span class="timeline-name">' + esc(r.tool) + "</span>" +
+              '<span class="timeline-track"><i class="timeline-bar ' + meta.cls +
+              '" style="display:block;width:' + width + '%"></i></span>' +
+              '<span class="timeline-time">' + human(r.durationMs || 0) + "</span>" +
+              "</div>"
+            );
+          }).join("");
+        }
+
+        function renderFailureCharts(summary, completed) {
+          summary = summary || {};
+          var execution = summary.executionFailed || 0;
+          var timeout = summary.timedOut || 0;
+          var transient = summary.transient || 0;
+          var verification = summary.verificationBlocked || 0;
+          var conflict = summary.editConflict || 0;
+          var raw = summary.rawFailed == null
+            ? execution + timeout + transient + verification + conflict
+            : summary.rawFailed;
+          var real = summary.realFailed == null ? execution + timeout + transient : summary.realFailed;
+          var guarded = verification + conflict;
+          var health = completed ? Math.max(0, Math.round(((completed - real) / completed) * 100)) : 100;
+
+          document.getElementById("s-real-failed").textContent = real;
+          document.getElementById("s-guarded").textContent = guarded;
+          document.getElementById("s-health").textContent = health + "%";
+          document.getElementById("tile-real-failed").classList.toggle("bad", real > 0);
+          document.getElementById("tile-guarded").classList.toggle("warn", guarded > 0);
+
+          document.getElementById("health-score").textContent = health;
+          document.getElementById("health-needle").style.transform =
+            "rotate(" + (-90 + health * 1.8) + "deg)";
+          var label = health >= 98 ? "健康" : health >= 90 ? "轻微异常" : health >= 75 ? "需要关注" : "异常偏多";
+          document.getElementById("health-label").textContent = label;
+          document.getElementById("health-copy").textContent =
+            real === 0
+              ? "没有真正执行故障。流程保护和编辑冲突单独统计，不再污染失败数。"
+              : "真正失败 " + real + " 次；保护性拦截 " + guarded + " 次。健康率只扣真正执行故障。";
+
+          document.getElementById("failure-total").textContent = raw;
+          var items = [
+            ["执行失败", execution, "#ff6b76"],
+            ["超时", timeout, "#a78bfa"],
+            ["瞬时异常", transient, "#4cc9f0"],
+            ["流程拦截", verification, "#f2b84b"],
+            ["编辑冲突", conflict, "#ffd166"]
+          ];
+          var cursor = 0;
+          var stops = [];
+          if (raw > 0) {
+            items.forEach(function (item) {
+              if (!item[1]) return;
+              var start = cursor;
+              cursor += (item[1] / raw) * 100;
+              stops.push(item[2] + " " + start.toFixed(2) + "% " + cursor.toFixed(2) + "%");
+            });
+          }
+          document.getElementById("failure-donut").style.background =
+            raw ? "conic-gradient(" + stops.join(",") + ")" : "#222b3a";
+          document.getElementById("failure-legend").innerHTML = items.map(function (item) {
+            return '<div class="legend-row"><i style="background:' + item[2] + '"></i>' +
+              "<span>" + item[0] + "</span><b>" + item[1] + "</b></div>";
+          }).join("");
         }
 
         function showRunning(list) {
@@ -393,7 +729,6 @@
           subline.textContent = head.detail || "";
         }
 
-        // Idle is still worth a line: the last call is what you want to see.
         function showIdle() {
           running = null;
           body.setAttribute("data-busy", "0");
@@ -419,14 +754,16 @@
             holdUntil = Date.now() + MIN_SHOW;
           }
           renderRecent(data.recent || [], data.serverTimeMs);
+          renderTimeline(data.recent || []);
           document.getElementById("s-session").textContent = data.completed;
         }
 
         function applySnapshot(data) {
-          latest = latest || data;
+          latest = data;
           paintGraph(data.history || [], data.serverTimeMs);
           renderTools(data.byTool || []);
           renderRecent(data.recent || [], data.serverTimeMs);
+          renderTimeline(data.recent || []);
           var usage = data.usage || {};
           document.getElementById("s-calls").textContent =
             usage.toolCallCount == null ? "—" : compact(usage.toolCallCount);
@@ -434,13 +771,7 @@
             usage.totalTokens == null ? "—" : compact(usage.totalTokens);
           document.getElementById("s-session").textContent =
             data.completed == null ? "—" : data.completed;
-          var failed = (data.byTool || []).reduce(function (sum, t) {
-            return sum + (t.failed || 0);
-          }, 0);
-          document.getElementById("s-failed").textContent = failed;
-          document
-            .getElementById("tile-failed")
-            .classList.toggle("warn", failed > 0);
+          renderFailureCharts(data.failureSummary || {}, data.completed || 0);
           if (!running) showIdle();
         }
 
@@ -462,7 +793,7 @@
         function loadSnapshot() {
           fetch(ACTIVITY, {
             cache: "no-store",
-            headers: { "ngrok-skip-browser-warning": "1" },
+            headers: { "ngrok-skip-browser-warning": "1" }
           })
             .then(function (r) { return r.ok ? r.json() : null; })
             .then(function (data) { if (data) applySnapshot(data); })

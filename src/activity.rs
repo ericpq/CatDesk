@@ -65,6 +65,7 @@ struct Finished {
     tool: String,
     detail: Option<String>,
     reason: Option<String>,
+    failure_kind: Option<&'static str>,
     duration_ms: u64,
     ok: bool,
     finished_ms: u64,
@@ -74,6 +75,11 @@ struct Finished {
 struct ToolStat {
     count: u64,
     failed: u64,
+    execution_failed: u64,
+    verification_blocked: u64,
+    edit_conflict: u64,
+    timed_out: u64,
+    transient: u64,
     total_ms: u64,
 }
 
@@ -81,8 +87,9 @@ struct ToolStat {
 struct Activity {
     in_flight: Vec<InFlight>,
     recent: Vec<Finished>,
-    /// `(finished_ms, ok)` only: the graph needs when and whether, not what.
-    history: VecDeque<(u64, bool)>,
+    /// `(finished_ms, ok, failure_kind)`: enough for the monitor to show
+    /// real execution failures separately from expected guardrail rejections.
+    history: VecDeque<(u64, bool, Option<&'static str>)>,
     by_tool: BTreeMap<String, ToolStat>,
     completed: u64,
 }
@@ -102,6 +109,51 @@ fn shorten(value: &str, limit: usize) -> String {
     let mut out: String = collapsed.chars().take(limit).collect();
     out.push('…');
     out
+}
+
+fn failure_kind(tool: &str, reason: Option<&str>) -> &'static str {
+    let reason = reason.unwrap_or_default().to_ascii_lowercase();
+
+    if reason.contains("timeout") || reason.contains("timed out") {
+        return "timeout";
+    }
+    if tool == "agent_checkpoint"
+        && (reason.contains("verification is still required")
+            || reason.contains("status=verifying")
+            || reason.contains("verification action"))
+    {
+        return "verification";
+    }
+    if matches!(tool, "apply_patch" | "edit")
+        && [
+            "context",
+            "did not match",
+            "does not match",
+            "old_string",
+            "old_text",
+            "hunk",
+            "patch failed",
+            "not found",
+        ]
+        .iter()
+        .any(|needle| reason.contains(needle))
+    {
+        return "edit_conflict";
+    }
+    if [
+        "connection reset",
+        "temporarily unavailable",
+        "transport",
+        "broken pipe",
+        "network",
+        "provider failed",
+    ]
+    .iter()
+    .any(|needle| reason.contains(needle))
+    {
+        return "transient";
+    }
+    "execution"
 }
 
 /// Registers a call as in flight until it is dropped, so a tool that returns
@@ -142,11 +194,22 @@ impl Drop for Guard {
             let stat = activity.by_tool.entry(entry.tool.clone()).or_default();
             stat.count += 1;
             stat.total_ms += duration_ms;
+            let failure_kind =
+                (!self.ok).then(|| failure_kind(&entry.tool, self.reason.as_deref()));
             if !self.ok {
                 stat.failed += 1;
+                match failure_kind {
+                    Some("verification") => stat.verification_blocked += 1,
+                    Some("edit_conflict") => stat.edit_conflict += 1,
+                    Some("timeout") => stat.timed_out += 1,
+                    Some("transient") => stat.transient += 1,
+                    _ => stat.execution_failed += 1,
+                }
             }
 
-            activity.history.push_back((finished_ms, self.ok));
+            activity
+                .history
+                .push_back((finished_ms, self.ok, failure_kind));
             while activity.history.len() > MAX_HISTORY {
                 activity.history.pop_front();
             }
@@ -158,6 +221,7 @@ impl Drop for Guard {
                     tool: entry.tool,
                     detail: entry.detail,
                     reason: self.reason.take(),
+                    failure_kind,
                     duration_ms,
                     ok: self.ok,
                     finished_ms,
@@ -196,6 +260,7 @@ fn finished_json(entry: &Finished) -> Value {
         "tool": entry.tool,
         "detail": entry.detail,
         "reason": entry.reason,
+        "failureKind": entry.failure_kind,
         "durationMs": entry.duration_ms,
         "ok": entry.ok,
         "finishedMs": entry.finished_ms,
@@ -248,7 +313,7 @@ pub fn full_snapshot() -> Value {
             activity
                 .history
                 .iter()
-                .map(|(finished_ms, ok)| json!([finished_ms, ok]))
+                .map(|(finished_ms, ok, failure_kind)| json!([finished_ms, ok, failure_kind]))
                 .collect::<Vec<_>>()
         ),
     );
@@ -263,10 +328,41 @@ pub fn full_snapshot() -> Value {
                     "tool": tool,
                     "count": stat.count,
                     "failed": stat.failed,
+                    "executionFailed": stat.execution_failed,
+                    "verificationBlocked": stat.verification_blocked,
+                    "editConflict": stat.edit_conflict,
+                    "timedOut": stat.timed_out,
+                    "transient": stat.transient,
                     "totalMs": stat.total_ms,
                 }))
                 .collect::<Vec<_>>()
         ),
+    );
+    let summary = activity
+        .by_tool
+        .values()
+        .fold(ToolStat::default(), |mut total, stat| {
+            total.count += stat.count;
+            total.failed += stat.failed;
+            total.execution_failed += stat.execution_failed;
+            total.verification_blocked += stat.verification_blocked;
+            total.edit_conflict += stat.edit_conflict;
+            total.timed_out += stat.timed_out;
+            total.transient += stat.transient;
+            total.total_ms += stat.total_ms;
+            total
+        });
+    object.insert(
+        "failureSummary".to_string(),
+        json!({
+            "rawFailed": summary.failed,
+            "realFailed": summary.execution_failed + summary.timed_out + summary.transient,
+            "executionFailed": summary.execution_failed,
+            "verificationBlocked": summary.verification_blocked,
+            "editConflict": summary.edit_conflict,
+            "timedOut": summary.timed_out,
+            "transient": summary.transient,
+        }),
     );
     drop(activity);
     value
@@ -366,6 +462,46 @@ mod tests {
             .find(|entry| entry["tool"] == json!("run_checks"))
             .expect("run_checks missing");
         assert_eq!(run_checks["failed"], json!(1));
+        assert_eq!(run_checks["executionFailed"], json!(1));
+
+        reset();
+    }
+
+    #[test]
+    fn expected_rejections_are_separate_from_real_failures() {
+        let _serial = serial();
+        reset();
+
+        let mut verification = begin("agent_checkpoint", None);
+        verification.set_result(
+            false,
+            Some(
+                "verification is still required after tool 'write'; set status=verifying"
+                    .to_string(),
+            ),
+        );
+        drop(verification);
+
+        let mut conflict = begin("apply_patch", None);
+        conflict.set_result(
+            false,
+            Some("patch failed: context did not match".to_string()),
+        );
+        drop(conflict);
+
+        let mut timeout = begin("run_command", None);
+        timeout.set_result(false, Some("command timed out".to_string()));
+        drop(timeout);
+
+        let full = full_snapshot();
+        assert_eq!(full["failureSummary"]["rawFailed"], json!(3));
+        assert_eq!(full["failureSummary"]["realFailed"], json!(1));
+        assert_eq!(full["failureSummary"]["verificationBlocked"], json!(1));
+        assert_eq!(full["failureSummary"]["editConflict"], json!(1));
+        assert_eq!(full["failureSummary"]["timedOut"], json!(1));
+        assert_eq!(full["recent"][0]["failureKind"], json!("timeout"));
+        assert_eq!(full["recent"][1]["failureKind"], json!("edit_conflict"));
+        assert_eq!(full["recent"][2]["failureKind"], json!("verification"));
 
         reset();
     }

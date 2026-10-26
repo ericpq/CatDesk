@@ -813,18 +813,15 @@ fn attach_catdesk_instruction_actions(
     let Some(result_obj) = result.as_mut().and_then(Value::as_object_mut) else {
         return;
     };
-    let Some(structured) = result_obj
-        .get_mut("structuredContent")
-        .and_then(Value::as_object_mut)
+    let Some(tool_name) = result_obj
+        .get("structuredContent")
+        .and_then(Value::as_object)
+        .and_then(|structured| structured.get("toolName"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
     else {
         return;
     };
-    let Some(tool_name) = structured.get("toolName").and_then(Value::as_str) else {
-        return;
-    };
-    if tool_name != "catdesk_instruction" {
-        return;
-    }
 
     let Some(widget_payload) = result_obj
         .get_mut("_meta")
@@ -838,6 +835,32 @@ fn attach_catdesk_instruction_actions(
     let public_action_base_url = public_base_url
         .zip(mcp_path.strip_suffix("/mcp"))
         .map(|(base, secret_prefix)| format!("{base}{secret_prefix}"));
+
+    if tool_name == "agent_status" {
+        widget_payload.insert(
+            "activityUrl".to_string(),
+            json!(
+                public_action_base_url
+                    .as_deref()
+                    .map(|base| format!("{base}/activity"))
+                    .unwrap_or_default()
+            ),
+        );
+        widget_payload.insert(
+            "activityStreamUrl".to_string(),
+            json!(
+                public_action_base_url
+                    .as_deref()
+                    .map(|base| format!("{base}/activity/stream"))
+                    .unwrap_or_default()
+            ),
+        );
+        return;
+    }
+    if tool_name != "catdesk_instruction" {
+        return;
+    }
+
     let binagotchy_action_base_url = public_action_base_url
         .as_deref()
         .map(|base| format!("{base}/binagotchy"));
