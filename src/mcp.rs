@@ -7320,11 +7320,8 @@ mod tests {
             .filter_map(|tool| tool.get("name").and_then(Value::as_str))
             .collect::<Vec<_>>();
 
-        assert_eq!(
-            names,
-            vec![
+        let mut expected = vec![
                 "run_command",
-                "root_command",
                 "start_command",
                 "poll_command",
                 "cancel_command",
@@ -7358,8 +7355,11 @@ mod tests {
                 "apply_patch",
                 "delete",
                 "checkpoint_restore",
-            ]
-        );
+            ];
+        if root_command_enabled() {
+            expected.insert(1, "root_command");
+        }
+        assert_eq!(names, expected);
     }
 
     #[tokio::test]
@@ -9508,6 +9508,9 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn read_tool_does_not_let_an_unreadable_file_shrink_the_others() {
+        if unsafe { libc::geteuid() == 0 } {
+            return; // chmod(000) is readable as root; run this test unprivileged
+        }
         let workspace_root = read_workspace("unreadable");
         let big = workspace_tools::MAX_READ_BYTES - 8192;
         std::fs::write(workspace_root.join("app.js"), filler(big)).expect("write file");
@@ -9607,6 +9610,9 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn read_tool_still_reports_an_unreadable_file_past_the_budget() {
+        if unsafe { libc::geteuid() == 0 } {
+            return; // chmod(000) is readable as root; run this test unprivileged
+        }
         let workspace_root = read_workspace("locked-past-budget");
         std::fs::write(
             workspace_root.join("big.txt"),
